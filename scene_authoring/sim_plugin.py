@@ -1,6 +1,7 @@
 """Simulation-side authoritative scene editing plugin."""
 
 from dataclasses import asdict
+from pathlib import Path
 
 import mujoco
 from mujoco.experimental.studio import messages as studio_messages
@@ -111,6 +112,18 @@ class SceneAuthoringSimPlugin:
       index += 1
     return f"{prefix}{index:03d}"
 
+  def _mesh_file_path(self, mesh_file):
+    path = Path(str(mesh_file)).expanduser()
+    if not path.is_absolute():
+      path = Path(self.source_path).expanduser().parent / path
+    return str(path)
+
+  def _mesh_asset(self, name):
+    for mesh in self.spec.meshes:
+      if mesh.name == name:
+        return mesh
+    return None
+
   def _add_node(self, kind, parent_path, name, values):
     parent = self._body_at_path(tuple(parent_path))
     position = list(values.get("position", (0.0, 0.0, 0.0)))
@@ -129,14 +142,27 @@ class SceneAuthoringSimPlugin:
         )
       return node
     if kind == "geom":
+      type_id = int(values.get("type", int(mujoco.mjtGeom.mjGEOM_BOX)))
+      meshname = values.get("meshname")
+      mesh_file = values.get("mesh_file")
+      if type_id == int(mujoco.mjtGeom.mjGEOM_MESH):
+        if not meshname:
+          raise ValueError("A mesh geom requires a mesh asset name")
+        if mesh_file and self._mesh_asset(meshname) is None:
+          self.spec.add_mesh(
+              name=str(meshname), file=self._mesh_file_path(mesh_file)
+          )
+        if self._mesh_asset(meshname) is None:
+          raise ValueError(f"Mesh asset not found: {meshname}")
       return parent.add_geom(
           name=name,
-          type=int(values.get("type", int(mujoco.mjtGeom.mjGEOM_BOX))),
+          type=type_id,
           pos=position,
           quat=quaternion,
           size=list(values.get("size", (0.1, 0.1, 0.1))),
           mass=float(values.get("mass", 1.0)),
           rgba=list(values.get("rgba", (0.35, 0.65, 1.0, 1.0))),
+          meshname=str(meshname) if meshname else None,
       )
     if kind == "site":
       return parent.add_site(

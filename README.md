@@ -53,6 +53,7 @@ does not patch or modify that checkout.
 ## Features
 
 - Box and sphere placement from the viewport.
+- Mesh geom creation from a user-selected mesh file, added to the MJCF `<asset>` section.
 - Static and dynamic primitives. Dynamic primitives receive a free joint.
 - Geometry picking and fallback placement on the world `Z=0` plane.
 - Scene Tree entries for bodies, geoms, sites and joints.
@@ -76,6 +77,7 @@ In the Scene Authoring panel:
 - Create a child body, geom or site.
 - A new body receives a default spherical site with radius `0.01`.
 - Geom and site creation dialogs expose the supported type and size fields.
+- Mesh geom creation exposes a mesh file path and X/Y/Z mesh scale.
 - Select a node to inspect and edit its properties.
 - Each successful edit recompiles the `MjSpec` and refreshes the Scene Tree,
   Property panel and viewport.
@@ -98,7 +100,11 @@ The `.xml` suffix is added when omitted, and an existing file is never
 silently overwritten.
 
 The current loader accepts MJCF XML paths. `.mjz`, binary model workflows,
-and asset/include path relocation are outside the current scope.
+and asset/include path relocation are outside the current scope. For a mesh
+geom, enter a path to an OBJ, STL, PLY or other MuJoCo-supported mesh file in
+the Create dialog. Relative paths are resolved against the directory of the
+MJCF currently open in Studio. The mesh is added as a new `<asset><mesh>` and
+the created geom references that asset.
 
 ## Architecture
 

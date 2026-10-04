@@ -1,6 +1,7 @@
 """Viewer-side ImGui, picking and preview plugin."""
 
 import itertools
+import re
 from pathlib import Path
 
 import mujoco
@@ -40,6 +41,7 @@ _CREATE_GEOM_TYPES = [
     (int(mujoco.mjtGeom.mjGEOM_ELLIPSOID), "ellipsoid"),
     (int(mujoco.mjtGeom.mjGEOM_CYLINDER), "cylinder"),
     (int(mujoco.mjtGeom.mjGEOM_BOX), "box"),
+    (int(mujoco.mjtGeom.mjGEOM_MESH), "mesh"),
 ]
 _CREATE_SITE_TYPES = [
     (int(mujoco.mjtGeom.mjGEOM_SPHERE), "sphere"),
@@ -75,6 +77,10 @@ class SceneAuthoringViewerPlugin:
     self._create_dialog_kind = ""
     self._create_dialog_parent_path = ()
     self._create_dialog_type_id = int(mujoco.mjtGeom.mjGEOM_BOX)
+    self._create_dialog_mesh_file = ""
+    self._mesh_browser_pending = False
+    self._mesh_browser_dir = ""
+    self._mesh_browser_error = ""
     self._create_dialog_size = [0.1, 0.1, 0.1]
     self._create_dialog_mass = 1.0
     self._scene_authoring_active = False
@@ -1376,8 +1382,33 @@ class SceneAuthoringViewerPlugin:
           int(mujoco.mjtGeom.mjGEOM_ELLIPSOID): [0.1, 0.1, 0.1],
           int(mujoco.mjtGeom.mjGEOM_CYLINDER): [0.03, 0.1, 0.0],
           int(mujoco.mjtGeom.mjGEOM_BOX): [0.1, 0.1, 0.1],
+          int(mujoco.mjtGeom.mjGEOM_MESH): [1.0, 1.0, 1.0],
       }
     return list(defaults.get(type_id, defaults[next(iter(defaults))]))
+
+  def _mesh_asset_names(self):
+    if self.viewer is None or self.viewer.model.nmesh <= 0:
+      return ()
+    names = []
+    for mesh_id in range(self.viewer.model.nmesh):
+      name = mujoco.mj_id2name(
+          self.viewer.model, mujoco.mjtObj.mjOBJ_MESH, mesh_id
+      )
+      if name:
+        names.append(name)
+    return tuple(names)
+
+  def _unique_mesh_name(self, mesh_file):
+    stem = Path(mesh_file).stem or "mesh"
+    stem = re.sub(r"[^A-Za-z0-9_]+", "_", stem).strip("_") or "mesh"
+    base = f"authored_mesh_{stem}"
+    names = set(self._mesh_asset_names())
+    candidate = base
+    index = 1
+    while candidate in names:
+      index += 1
+      candidate = f"{base}_{index:03d}"
+    return candidate
 
   def _open_create_dialog(self, kind, parent_node):
     self._pause()
@@ -1385,12 +1416,81 @@ class SceneAuthoringViewerPlugin:
     self._create_dialog_parent_path = tuple(parent_node.target_path)
     options = _CREATE_GEOM_TYPES if kind == "geom" else _CREATE_SITE_TYPES
     self._create_dialog_type_id = options[0][0]
+    self._create_dialog_mesh_file = ""
     self._create_dialog_size = self._create_size_defaults(
         kind, self._create_dialog_type_id
     )
     self._create_dialog_mass = 1.0
     self._create_dialog_pending = True
     self._create_error = ""
+
+  def _open_mesh_browser(self):
+    current = Path(self._create_dialog_mesh_file).expanduser()
+    if not current.is_absolute():
+      source = self.state.scene_source_path
+      base = Path(source).expanduser().parent if source else Path.cwd()
+      current = base / current
+    directory = current if current.is_dir() else current.parent
+    self._mesh_browser_dir = str(directory)
+    self._mesh_browser_error = ""
+    self._mesh_browser_pending = True
+
+  def _draw_mesh_file_browser(self):
+    if self._mesh_browser_pending:
+      imgui.OpenPopup("Select Mesh File##SceneAuthoring")
+      self._mesh_browser_pending = False
+    if not imgui.BeginPopup("Select Mesh File##SceneAuthoring"):
+      return
+
+    directory = Path(self._mesh_browser_dir or Path.cwd()).expanduser()
+    if not directory.is_dir():
+      directory = Path.cwd()
+      self._mesh_browser_dir = str(directory)
+
+    changed, value = imgui.InputText("Folder##MeshBrowser", str(directory))
+    if changed:
+      candidate = Path(value).expanduser()
+      if candidate.is_dir():
+        self._mesh_browser_dir = str(candidate)
+        self._mesh_browser_error = ""
+      else:
+        self._mesh_browser_error = "Folder does not exist."
+    if imgui.Button("Up##MeshBrowser", imgui.Vec2(90, 0)):
+      self._mesh_browser_dir = str(directory.parent)
+      self._mesh_browser_error = ""
+    imgui.SameLine()
+    imgui.TextWrapped(str(directory))
+
+    if self._mesh_browser_error:
+      imgui.TextColored(
+          imgui.Vec4(1.0, 0.35, 0.25, 1.0), self._mesh_browser_error
+      )
+
+    if imgui.BeginChild(
+        "MeshBrowserFiles", imgui.Vec2(520, 260), True
+    ):
+      try:
+        entries = sorted(
+            directory.iterdir(), key=lambda item: (not item.is_dir(), item.name.lower())
+        )
+      except OSError as exc:
+        entries = []
+        self._mesh_browser_error = str(exc)
+      extensions = {".obj", ".stl", ".ply", ".msh", ".mesh"}
+      for entry in entries:
+        if entry.is_dir():
+          if imgui.Selectable(f"[DIR] {entry.name}##MeshBrowser"):
+            self._mesh_browser_dir = str(entry)
+            self._mesh_browser_error = ""
+        elif entry.suffix.lower() in extensions:
+          if imgui.Selectable(f"{entry.name}##MeshBrowser"):
+            self._create_dialog_mesh_file = str(entry)
+            imgui.CloseCurrentPopup()
+      imgui.EndChild()
+
+    if imgui.Button("Cancel##MeshBrowser", imgui.Vec2(100, 0)):
+      imgui.CloseCurrentPopup()
+    imgui.EndPopup()
 
   def _create_node(self, kind, parent_path=None, values_override=None):
     if parent_path is None:
@@ -1480,6 +1580,20 @@ class SceneAuthoringViewerPlugin:
           kind, self._create_dialog_type_id
       )
 
+    is_mesh = self._create_dialog_type_id == int(mujoco.mjtGeom.mjGEOM_MESH)
+    if is_mesh:
+      changed, mesh_file = imgui.InputText(
+          "Mesh file", self._create_dialog_mesh_file
+      )
+      if changed:
+        self._create_dialog_mesh_file = mesh_file
+      imgui.SameLine()
+      if imgui.Button("Browse...##MeshBrowser", imgui.Vec2(100, 0)):
+        self._open_mesh_browser()
+      imgui.TextDisabled(
+          "Path to an OBJ, STL, PLY or supported MuJoCo mesh file."
+      )
+
     descriptions = {
         "plane": "Half-size X/Y",
         "sphere": "Radius",
@@ -1487,6 +1601,7 @@ class SceneAuthoringViewerPlugin:
         "ellipsoid": "Radii X/Y/Z",
         "cylinder": "Radius / half-length",
         "box": "Half-extents X/Y/Z",
+        "mesh": "Mesh scale X/Y/Z",
     }
     type_label = labels[selected].lower()
     imgui.TextDisabled(descriptions.get(type_label, "Size"))
@@ -1506,29 +1621,41 @@ class SceneAuthoringViewerPlugin:
       if changed:
         self._create_dialog_mass = max(0.001, float(value))
 
-    if imgui.Button("Create", imgui.Vec2(100, 0)):
-      values = {
-          "position": (0.0, 0.0, 0.0),
-          "quaternion": (1.0, 0.0, 0.0, 0.0),
-          "type": self._create_dialog_type_id,
-          "size": tuple(self._create_dialog_size),
-          "rgba": (
-              (0.35, 0.65, 1.0, 1.0)
-              if kind == "geom" else (1.0, 0.3, 0.2, 1.0)
-          ),
-      }
-      if kind == "geom":
-        values["mass"] = self._create_dialog_mass
-      self._create_node(
-          kind,
-          parent_path=self._create_dialog_parent_path,
-          values_override=values,
+    if self._create_error:
+      imgui.TextColored(
+          imgui.Vec4(1.0, 0.35, 0.25, 1.0), self._create_error
       )
-      imgui.CloseCurrentPopup()
+    if imgui.Button("Create", imgui.Vec2(100, 0)):
+      mesh_file = self._create_dialog_mesh_file.strip()
+      if is_mesh and not mesh_file:
+        self._create_error = "Choose a mesh file before creating the geom."
+      else:
+        values = {
+            "position": (0.0, 0.0, 0.0),
+            "quaternion": (1.0, 0.0, 0.0, 0.0),
+            "type": self._create_dialog_type_id,
+            "size": tuple(self._create_dialog_size),
+            "rgba": (
+                (0.35, 0.65, 1.0, 1.0)
+                if kind == "geom" else (1.0, 0.3, 0.2, 1.0)
+            ),
+        }
+        if kind == "geom":
+          values["mass"] = self._create_dialog_mass
+          if is_mesh:
+            values["mesh_file"] = mesh_file
+            values["meshname"] = self._unique_mesh_name(mesh_file)
+        self._create_node(
+            kind,
+            parent_path=self._create_dialog_parent_path,
+            values_override=values,
+        )
+        imgui.CloseCurrentPopup()
     imgui.SameLine()
     if imgui.Button("Cancel", imgui.Vec2(100, 0)):
       imgui.CloseCurrentPopup()
     imgui.EndPopup()
+    self._draw_mesh_file_browser()
 
   def _open_save_popup(self):
     self._pause()
