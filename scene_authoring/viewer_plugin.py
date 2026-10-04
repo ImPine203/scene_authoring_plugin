@@ -703,6 +703,7 @@ class SceneAuthoringViewerPlugin:
         target_path=tuple(node.target_path),
         element_index=node.element_index,
         values=values,
+        target_name=node.name,
     ))
     self._clear_gizmo_drag()
 
@@ -1144,6 +1145,7 @@ class SceneAuthoringViewerPlugin:
         target_path=tuple(node.target_path),
         element_index=node.element_index,
         values=values,
+        target_name=node.name,
     ))
 
   def _draw_property(self, label, value):

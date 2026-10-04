@@ -58,6 +58,7 @@ class EditNodeEvent(studio_messages.Event):
   target_path: tuple[int, ...]
   element_index: int
   values: dict
+  target_name: str = ""
 
 
 @dataclass(frozen=True)

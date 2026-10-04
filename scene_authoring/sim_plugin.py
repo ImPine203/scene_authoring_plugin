@@ -4,6 +4,7 @@ from dataclasses import asdict
 from pathlib import Path
 
 import mujoco
+import numpy as np
 from mujoco.experimental.studio import messages as studio_messages
 
 from scene_authoring import messages
@@ -61,7 +62,18 @@ class SceneAuthoringSimPlugin:
     self.publish_scene_scan()
 
   def _recompile(self):
+    state_sig = mujoco.mjtState.mjSTATE_INTEGRATION
+    state = None
+    if self.model is not None and self.data is not None:
+      state = np.empty(
+          mujoco.mj_stateSize(self.model, state_sig), dtype=np.float64
+      )
+      mujoco.mj_getState(self.model, self.data, state, state_sig)
     self.model, self.data = self.spec.recompile(self.model, self.data)
+    if state is not None:
+      new_state_size = mujoco.mj_stateSize(self.model, state_sig)
+      if len(state) == new_state_size:
+        mujoco.mj_setState(self.model, self.data, state, state_sig)
     mujoco.mj_forward(self.model, self.data)
     self._publish_model()
 
@@ -92,7 +104,40 @@ class SceneAuthoringSimPlugin:
       body = bodies[index]
     return body
 
-  def _resolve_node(self, kind, target_path, element_index=-1):
+  def _find_body_by_name(self, name):
+    def visit(body):
+      if str(body.name or "") == name:
+        return body
+      for child in body.bodies:
+        found = visit(child)
+        if found is not None:
+          return found
+      return None
+
+    return visit(self.spec.worldbody)
+
+  def _resolve_node(
+      self, kind, target_path, element_index=-1, target_name=""
+  ):
+    if target_name:
+      if kind == "body":
+        named_body = self._find_body_by_name(target_name)
+        if named_body is not None:
+          return named_body
+      else:
+        def visit(body):
+          for candidate in getattr(body, f"{kind}s"):
+            if str(candidate.name or "") == target_name:
+              return candidate
+          for child in body.bodies:
+            found = visit(child)
+            if found is not None:
+              return found
+          return None
+
+        named_node = visit(self.spec.worldbody)
+        if named_node is not None:
+          return named_node
     body = self._body_at_path(tuple(target_path))
     if kind == "body":
       return body
@@ -306,7 +351,7 @@ class SceneAuthoringSimPlugin:
   def _on_edit_node(self, event: messages.EditNodeEvent) -> bool:
     try:
       node = self._resolve_node(
-          event.kind, event.target_path, event.element_index
+          event.kind, event.target_path, event.element_index, event.target_name
       )
       before = self._node_values(event.kind, node)
       scale_only = (
