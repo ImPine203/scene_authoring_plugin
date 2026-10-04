@@ -59,6 +59,7 @@ class SceneAuthoringViewerPlugin:
     self.state = AuthoringState()
     self._request_ids = itertools.count(1)
     self._owned_geoms = []
+    self._mesh_preview_original = None
     self._last_mouse_ray = None
     self._drag_start_ray = None
     self._scene_nodes = {}
@@ -196,6 +197,7 @@ class SceneAuthoringViewerPlugin:
   @studio_messages.handler(priority=studio_messages.Priority.LIBRARY)
   def _on_model(self, event: studio_messages.ModelEvent) -> bool:
     del event
+    self._mesh_preview_original = None
     self._pause_after_model_update = self._authoring_pause_lock
     self._remove_owned_geoms()
     self.state.selected_body_id = self._resolve_selected_body()
@@ -377,9 +379,33 @@ class SceneAuthoringViewerPlugin:
       position = self.viewer.data.xpos[object_id]
       matrix = self.viewer.data.xmat[object_id].reshape(3, 3)
     elif node.kind == "geom":
+      if int(node.type_id) == int(mujoco.mjtGeom.mjGEOM_MESH):
+        # A mesh's compiled model pose includes the asset's internal
+        # centering/orientation transform. Gizmo operations must use the
+        # logical MJCF geom frame, otherwise R/P/S writes compiled values
+        # back into the geom and can move the visible mesh unexpectedly.
+        parent_position, parent_matrix = self._parent_pose(node)
+        local_matrix = np.empty((3, 3), dtype=np.float64)
+        mujoco.mju_quat2Mat(
+            local_matrix.reshape(-1), np.asarray(node.quaternion, dtype=np.float64)
+        )
+        return (
+            parent_position + parent_matrix @ np.asarray(node.position),
+            parent_matrix @ local_matrix,
+        )
       position = self.viewer.data.geom_xpos[object_id]
       matrix = self.viewer.data.geom_xmat[object_id].reshape(3, 3)
     else:
+      if int(node.type_id) == int(mujoco.mjtGeom.mjGEOM_MESH):
+        parent_position, parent_matrix = self._parent_pose(node)
+        local_matrix = np.empty((3, 3), dtype=np.float64)
+        mujoco.mju_quat2Mat(
+            local_matrix.reshape(-1), np.asarray(node.quaternion, dtype=np.float64)
+        )
+        return (
+            parent_position + parent_matrix @ np.asarray(node.position),
+            parent_matrix @ local_matrix,
+        )
       position = self.viewer.data.site_xpos[object_id]
       matrix = self.viewer.data.site_xmat[object_id].reshape(3, 3)
     return np.asarray(position, dtype=np.float64).copy(), np.asarray(matrix, dtype=np.float64).copy()
@@ -610,6 +636,7 @@ class SceneAuthoringViewerPlugin:
     return np.eye(3, dtype=np.float64)
 
   def _clear_gizmo_drag(self):
+    self._restore_mesh_preview()
     self._gizmo_axis = None
     self._gizmo_start_ray = None
     self._gizmo_start_mouse = None
@@ -626,6 +653,123 @@ class SceneAuthoringViewerPlugin:
     self._gizmo_preview_local_position = None
     self._gizmo_preview_quaternion = None
     self._gizmo_preview_size = None
+    self._mesh_preview_original = None
+
+  def _capture_mesh_preview(self, node):
+    if (
+        self.viewer is None
+        or node.kind not in ("geom", "site")
+        or int(node.type_id) != int(mujoco.mjtGeom.mjGEOM_MESH)
+    ):
+      self._mesh_preview_original = None
+      return
+    object_id = self._model_id_for_node(node)
+    if object_id < 0:
+      self._mesh_preview_original = None
+      return
+    model = self.viewer.model
+    logical_position = np.asarray(node.position, dtype=np.float64)
+    logical_matrix = np.empty((3, 3), dtype=np.float64)
+    mujoco.mju_quat2Mat(
+        logical_matrix.reshape(-1), np.asarray(node.quaternion, dtype=np.float64)
+    )
+    if node.kind == "geom":
+      compiled_position = model.geom_pos[object_id].copy()
+      compiled_matrix = np.empty((3, 3), dtype=np.float64)
+      mujoco.mju_quat2Mat(
+          compiled_matrix.reshape(-1), model.geom_quat[object_id]
+      )
+      # Mesh compilation folds an asset-local transform into the model geom
+      # pose. Keep that transform separate so a preview can use the MJCF
+      # geom pose without writing the compiled mesh pose back as XML values.
+      asset_matrix = logical_matrix.T @ compiled_matrix
+      # The asset translation is expressed in the logical geom frame. The
+      # equivalent homogeneous composition is used below for both position
+      # and orientation.
+      asset_position = logical_matrix.T @ compiled_position - (
+          logical_matrix.T @ logical_position
+      )
+      self._mesh_preview_original = (
+          id(model), node.kind, object_id,
+          compiled_position,
+          model.geom_quat[object_id].copy(),
+          model.geom_size[object_id].copy(),
+          asset_position,
+          asset_matrix,
+      )
+    else:
+      compiled_position = model.site_pos[object_id].copy()
+      compiled_matrix = np.empty((3, 3), dtype=np.float64)
+      mujoco.mju_quat2Mat(
+          compiled_matrix.reshape(-1), model.site_quat[object_id]
+      )
+      asset_matrix = logical_matrix.T @ compiled_matrix
+      asset_position = logical_matrix.T @ compiled_position - (
+          logical_matrix.T @ logical_position
+      )
+      self._mesh_preview_original = (
+          id(model), node.kind, object_id,
+          compiled_position,
+          model.site_quat[object_id].copy(),
+          model.site_size[object_id].copy(),
+          asset_position,
+          asset_matrix,
+      )
+
+  def _restore_mesh_preview(self):
+    if self.viewer is None or self._mesh_preview_original is None:
+      return
+    model_id, kind, object_id, position, quaternion, size, _, _ = (
+        self._mesh_preview_original
+    )
+    model = self.viewer.model
+    if id(model) != model_id:
+      return
+    if kind == "geom":
+      model.geom_pos[object_id] = position
+      model.geom_quat[object_id] = quaternion
+      model.geom_size[object_id] = size
+    else:
+      model.site_pos[object_id] = position
+      model.site_quat[object_id] = quaternion
+      model.site_size[object_id] = size
+    mujoco.mj_forward(model, self.viewer.data)
+
+  def _apply_mesh_preview(self, node):
+    if self.viewer is None or self._mesh_preview_original is None:
+      return
+    (
+        model_id, kind, object_id, _, _, original_size,
+        asset_position, asset_matrix,
+    ) = self._mesh_preview_original
+    model = self.viewer.model
+    if id(model) != model_id or node.kind != kind:
+      return
+    position = np.asarray(self._gizmo_preview_local_position, dtype=np.float64)
+    logical_matrix = np.empty((3, 3), dtype=np.float64)
+    mujoco.mju_quat2Mat(
+        logical_matrix.reshape(-1),
+        np.asarray(self._gizmo_preview_quaternion, dtype=np.float64),
+    )
+    compiled_position = position + logical_matrix @ asset_position
+    compiled_matrix = logical_matrix @ asset_matrix
+    quaternion = np.empty(4, dtype=np.float64)
+    mujoco.mju_mat2Quat(quaternion, compiled_matrix.reshape(-1))
+    start_size = np.asarray(self._gizmo_start_size, dtype=np.float64)
+    preview_size = np.asarray(self._gizmo_preview_size, dtype=np.float64)
+    ratio = np.ones(3, dtype=np.float64)
+    nonzero = np.abs(start_size) > 1e-9
+    ratio[nonzero] = preview_size[nonzero] / start_size[nonzero]
+    size = np.asarray(original_size, dtype=np.float64) * ratio
+    if kind == "geom":
+      model.geom_pos[object_id] = compiled_position
+      model.geom_quat[object_id] = quaternion
+      model.geom_size[object_id] = size
+    else:
+      model.site_pos[object_id] = compiled_position
+      model.site_quat[object_id] = quaternion
+      model.site_size[object_id] = size
+    mujoco.mj_forward(model, self.viewer.data)
 
   def _pick_site(self, ray_origin, ray_direction):
     best = None
@@ -684,6 +828,7 @@ class SceneAuthoringViewerPlugin:
     self._gizmo_preview_local_position = self._gizmo_start_local_position.copy()
     self._gizmo_preview_quaternion = self._gizmo_start_quaternion.copy()
     self._gizmo_preview_size = self._gizmo_start_size.copy()
+    self._capture_mesh_preview(node)
     return True
 
   def _scaled_size(self, node, factor, axis):
@@ -966,6 +1111,9 @@ class SceneAuthoringViewerPlugin:
       return
     if self.state.preview_position is not None and self.state.placing:
       self._make_primitive_preview(self.state.preview_position)
+    node = self._target_node()
+    if self._gizmo_axis is not None and node is not None:
+      self._apply_mesh_preview(node)
     self._draw_gizmo()
 
   def _mouse(self):
@@ -1171,7 +1319,7 @@ class SceneAuthoringViewerPlugin:
         flags |= int(imgui.TreeNodeFlags.Selected)
       opened = imgui.TreeNodeEx(node.key, flags, node.label)
       self._handle_scene_item_click(node)
-      if node.kind == "body":
+      if node.kind in ("body", "geom", "site"):
         self._draw_create_context(node)
       if opened:
         for child_key in node.child_keys:
@@ -1181,7 +1329,7 @@ class SceneAuthoringViewerPlugin:
 
     imgui.Selectable(f"{node.label}##{node.key}", selected)
     self._handle_scene_item_click(node)
-    if node.kind == "body":
+    if node.kind in ("body", "geom", "site"):
       self._draw_create_context(node)
 
   def _draw_scene_tree(self):
@@ -1622,23 +1770,31 @@ class SceneAuthoringViewerPlugin:
     ))
 
   def _draw_create_context(self, node):
-    popup_id = f"Create##{node.key}"
+    popup_id = f"Scene Actions##{node.key}"
     if imgui.IsItemClicked(imgui.MouseButton.Right):
       self._select_inspected_node(node.key)
       imgui.OpenPopup(popup_id)
     if not imgui.BeginPopup(popup_id):
       return
-    imgui.Text("Create")
-    imgui.TextDisabled(f"Child of {node.name or '(unnamed body)'}")
+    imgui.Text("Scene Actions")
+    imgui.TextDisabled(node.label)
     imgui.Separator()
-    if imgui.Button("Body", imgui.Vec2(180, 0)):
-      self._create_node("body", parent_path=node.target_path)
-      imgui.CloseCurrentPopup()
-    if imgui.Button("Geom", imgui.Vec2(180, 0)):
-      self._open_create_dialog("geom", node)
-      imgui.CloseCurrentPopup()
-    if imgui.Button("Site", imgui.Vec2(180, 0)):
-      self._open_create_dialog("site", node)
+
+    if node.kind == "body" and imgui.BeginMenu("Create"):
+      if imgui.MenuItem("Body"):
+        self._create_node("body", parent_path=node.target_path)
+        imgui.CloseCurrentPopup()
+      if imgui.MenuItem("Geom"):
+        self._open_create_dialog("geom", node)
+        imgui.CloseCurrentPopup()
+      if imgui.MenuItem("Site"):
+        self._open_create_dialog("site", node)
+        imgui.CloseCurrentPopup()
+      imgui.EndMenu()
+
+    rename_enabled = not (node.kind == "body" and not node.target_path)
+    if imgui.MenuItem("Rename", enabled=rename_enabled):
+      self._begin_rename(node)
       imgui.CloseCurrentPopup()
     imgui.EndPopup()
 

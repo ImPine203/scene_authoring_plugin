@@ -60,6 +60,7 @@ does not patch or modify that checkout.
 - Double-click a body, geom or site name in the Scene Tree to rename it.
 - Double-click gizmo activation for body, geom and site nodes.
 - XYZ translation, `R` rotation and `S` axis scaling for supported nodes.
+- Mesh geoms use a live viewer-model preview while moving, rotating or scaling.
 - Property editing for MJCF attributes, including vector-valued `pos` and
   `quat` fields.
 - Plugin-owned undo, redo and deletion.
@@ -76,6 +77,8 @@ In the Scene Authoring panel:
 
 - Right-click a body in the Scene Tree to open the Create menu.
 - Create a child body, geom or site.
+- Right-click a body, geom or site to open Scene Actions; choose **Create** or
+  **Rename** when available.
 - A new body receives a default spherical site with radius `0.01`.
 - Geom and site creation dialogs expose the supported type and size fields.
 - Mesh geom creation exposes a mesh file path and X/Y/Z mesh scale.
