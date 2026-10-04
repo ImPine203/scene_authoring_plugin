@@ -78,7 +78,7 @@ class SceneAuthoringViewerPlugin:
     self._create_dialog_parent_path = ()
     self._create_dialog_type_id = int(mujoco.mjtGeom.mjGEOM_BOX)
     self._create_dialog_mesh_file = ""
-    self._mesh_browser_pending = False
+    self._mesh_browser_open = False
     self._mesh_browser_dir = ""
     self._mesh_browser_error = ""
     self._create_dialog_size = [0.1, 0.1, 0.1]
@@ -1417,6 +1417,7 @@ class SceneAuthoringViewerPlugin:
     options = _CREATE_GEOM_TYPES if kind == "geom" else _CREATE_SITE_TYPES
     self._create_dialog_type_id = options[0][0]
     self._create_dialog_mesh_file = ""
+    self._mesh_browser_open = False
     self._create_dialog_size = self._create_size_defaults(
         kind, self._create_dialog_type_id
     )
@@ -1433,15 +1434,14 @@ class SceneAuthoringViewerPlugin:
     directory = current if current.is_dir() else current.parent
     self._mesh_browser_dir = str(directory)
     self._mesh_browser_error = ""
-    self._mesh_browser_pending = True
+    self._mesh_browser_open = True
 
   def _draw_mesh_file_browser(self):
-    if self._mesh_browser_pending:
-      imgui.OpenPopup("Select Mesh File##SceneAuthoring")
-      self._mesh_browser_pending = False
-    if not imgui.BeginPopup("Select Mesh File##SceneAuthoring"):
+    if not self._mesh_browser_open:
       return
 
+    imgui.Separator()
+    imgui.Text("Select mesh file")
     directory = Path(self._mesh_browser_dir or Path.cwd()).expanduser()
     if not directory.is_dir():
       directory = Path.cwd()
@@ -1485,12 +1485,11 @@ class SceneAuthoringViewerPlugin:
         elif entry.suffix.lower() in extensions:
           if imgui.Selectable(f"{entry.name}##MeshBrowser"):
             self._create_dialog_mesh_file = str(entry)
-            imgui.CloseCurrentPopup()
+            self._mesh_browser_open = False
       imgui.EndChild()
 
     if imgui.Button("Cancel##MeshBrowser", imgui.Vec2(100, 0)):
-      imgui.CloseCurrentPopup()
-    imgui.EndPopup()
+      self._mesh_browser_open = False
 
   def _create_node(self, kind, parent_path=None, values_override=None):
     if parent_path is None:
@@ -1579,6 +1578,7 @@ class SceneAuthoringViewerPlugin:
       self._create_dialog_size = self._create_size_defaults(
           kind, self._create_dialog_type_id
       )
+      self._mesh_browser_open = False
 
     is_mesh = self._create_dialog_type_id == int(mujoco.mjtGeom.mjGEOM_MESH)
     if is_mesh:
@@ -1593,6 +1593,7 @@ class SceneAuthoringViewerPlugin:
       imgui.TextDisabled(
           "Path to an OBJ, STL, PLY or supported MuJoCo mesh file."
       )
+      self._draw_mesh_file_browser()
 
     descriptions = {
         "plane": "Half-size X/Y",
@@ -1655,7 +1656,6 @@ class SceneAuthoringViewerPlugin:
     if imgui.Button("Cancel", imgui.Vec2(100, 0)):
       imgui.CloseCurrentPopup()
     imgui.EndPopup()
-    self._draw_mesh_file_browser()
 
   def _open_save_popup(self):
     self._pause()
