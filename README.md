@@ -57,6 +57,7 @@ does not patch or modify that checkout.
 - Static and dynamic primitives. Dynamic primitives receive a free joint.
 - Geometry picking and fallback placement on the world `Z=0` plane.
 - Scene Tree entries for bodies, geoms, sites and joints.
+- Double-click a body, geom or site name in the Scene Tree to rename it.
 - Double-click gizmo activation for body, geom and site nodes.
 - XYZ translation, `R` rotation and `S` axis scaling for supported nodes.
 - Property editing for MJCF attributes, including vector-valued `pos` and
@@ -84,11 +85,12 @@ In the Scene Authoring panel:
 
 ## Viewport gizmo
 
-Double-click a body, geom or site in the viewport or Scene Tree to activate
-the gizmo. Drag an axis to translate the selected node. Press `R` and drag an
-axis to rotate its quaternion. Press `S` and drag an axis to scale supported
-geom/site dimensions. Press `P` or `T` to return to translation mode. Press
-`Esc` to cancel the current gizmo mode.
+Double-click a body, geom or site in the viewport to activate the gizmo.
+Double-click its name in the Scene Tree to rename it. Drag a world-aligned
+axis to translate the selected node. Press `R` and drag an axis to rotate its
+quaternion using the object's current orientation. Press `S` and drag an axis
+to scale supported geom/site dimensions. Press `P` or `T` to return to
+translation mode. Press `Esc` to cancel the current gizmo mode.
 
 A body has no MJCF `size` attribute, so body scaling is not available. Body
 translation and rotation are supported.

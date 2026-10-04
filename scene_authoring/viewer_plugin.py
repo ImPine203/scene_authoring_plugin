@@ -83,6 +83,10 @@ class SceneAuthoringViewerPlugin:
     self._mesh_browser_error = ""
     self._create_dialog_size = [0.1, 0.1, 0.1]
     self._create_dialog_mass = 1.0
+    self._rename_popup_pending = False
+    self._rename_node_key = None
+    self._rename_buffer = ""
+    self._rename_error = ""
     self._scene_authoring_active = False
     self._authoring_pause_lock = False
     self._pause_after_model_update = False
@@ -96,6 +100,7 @@ class SceneAuthoringViewerPlugin:
     self._gizmo_start_mouse = None
     self._gizmo_start_world_position = None
     self._gizmo_start_world_matrix = None
+    self._gizmo_start_handle_matrix = None
     self._gizmo_start_display_origin = None
     self._gizmo_parent_position = None
     self._gizmo_parent_matrix = None
@@ -539,12 +544,78 @@ class SceneAuthoringViewerPlugin:
     self.state.status = f"Gizmo {node.kind}: {node.name or '(unnamed)'}"
     return True
 
+  def _begin_rename(self, node):
+    if node.kind == "body" and not node.target_path:
+      return
+    self._select_inspected_node(node.key)
+    self._activate_gizmo_node(node)
+    self._rename_node_key = node.key
+    self._rename_buffer = node.name
+    self._rename_error = ""
+    self._rename_popup_pending = True
+
+  def _draw_rename_popup(self):
+    if self._rename_popup_pending:
+      imgui.OpenPopup("Rename Element##SceneAuthoring")
+      self._rename_popup_pending = False
+    if not imgui.BeginPopup("Rename Element##SceneAuthoring"):
+      return
+
+    node = self._scene_nodes.get(self._rename_node_key)
+    if node is None:
+      imgui.CloseCurrentPopup()
+      imgui.EndPopup()
+      return
+    imgui.Text(f"Rename {node.kind}")
+    changed, value = imgui.InputText("Name##RenameElement", self._rename_buffer)
+    if changed:
+      self._rename_buffer = value
+    if self._rename_error:
+      imgui.TextColored(
+          imgui.Vec4(1.0, 0.35, 0.25, 1.0), self._rename_error
+      )
+
+    commit = imgui.Button("Rename##RenameElement", imgui.Vec2(110, 0))
+    if imgui.IsItemDeactivatedAfterEdit() or imgui.IsKeyPressed(
+        imgui.Key.Enter, False
+    ):
+      commit = True
+    if commit:
+      name = self._rename_buffer.strip()
+      if not name:
+        self._rename_error = "Name cannot be empty."
+      elif name == node.name:
+        imgui.CloseCurrentPopup()
+        self._rename_node_key = None
+      else:
+        self._send(messages.EditNodeEvent(
+            request_id=self._next_request(),
+            kind=node.kind,
+            target_path=tuple(node.target_path),
+            element_index=node.element_index,
+            values={"name": name},
+            target_name=node.name,
+        ))
+        self._rename_node_key = None
+        imgui.CloseCurrentPopup()
+    imgui.SameLine()
+    if imgui.Button("Cancel##RenameElement", imgui.Vec2(110, 0)):
+      self._rename_node_key = None
+      imgui.CloseCurrentPopup()
+    imgui.EndPopup()
+
+  def _gizmo_handle_matrix(self, object_matrix):
+    if self._gizmo_mode == "rotate":
+      return object_matrix
+    return np.eye(3, dtype=np.float64)
+
   def _clear_gizmo_drag(self):
     self._gizmo_axis = None
     self._gizmo_start_ray = None
     self._gizmo_start_mouse = None
     self._gizmo_start_world_position = None
     self._gizmo_start_world_matrix = None
+    self._gizmo_start_handle_matrix = None
     self._gizmo_start_display_origin = None
     self._gizmo_parent_position = None
     self._gizmo_parent_matrix = None
@@ -600,6 +671,7 @@ class SceneAuthoringViewerPlugin:
     self._gizmo_start_mouse = (mouse[0], mouse[1])
     self._gizmo_start_world_position = pose[0]
     self._gizmo_start_world_matrix = pose[1]
+    self._gizmo_start_handle_matrix = self._gizmo_handle_matrix(pose[1])
     length = self._gizmo_length(pose[0])
     self._gizmo_start_display_origin = self._gizmo_display_origin(
         node, pose[0], length
@@ -643,9 +715,9 @@ class SceneAuthoringViewerPlugin:
       delta = gizmo.drag_delta(
           self._gizmo_axis, self._gizmo_start_ray, ray,
           self._gizmo_start_display_origin,
-          basis=self._gizmo_start_world_matrix,
+          basis=self._gizmo_start_handle_matrix,
       )
-      direction = self._gizmo_start_world_matrix @ gizmo.axis_vector(
+      direction = self._gizmo_start_handle_matrix @ gizmo.axis_vector(
           self._gizmo_axis
       )
       world_position = self._gizmo_start_world_position + direction * delta
@@ -678,7 +750,7 @@ class SceneAuthoringViewerPlugin:
       factor = gizmo.scale_factor(
           self._gizmo_axis, self._gizmo_start_ray, ray,
           self._gizmo_start_display_origin, reference,
-          basis=self._gizmo_start_world_matrix,
+          basis=self._gizmo_start_handle_matrix,
       )
       self._gizmo_preview_size = self._scaled_size(node, factor, self._gizmo_axis)
 
@@ -855,6 +927,7 @@ class SceneAuthoringViewerPlugin:
         else pose[0]
     )
     matrix = self._preview_world_matrix(node)
+    handle_matrix = self._gizmo_handle_matrix(matrix)
     self._draw_object_preview(node, origin, matrix)
     length = self._gizmo_length(origin)
     display_origin = self._gizmo_display_origin(node, origin, length)
@@ -866,7 +939,8 @@ class SceneAuthoringViewerPlugin:
           color = (1.0, 1.0, 0.15, 1.0)
         ring_thickness = max(0.003, min(0.017, length * 0.022))
         for start, end in gizmo.rotation_ring_segments(
-            display_origin, axis, radius=ring_radius, segments=96, basis=matrix
+            display_origin, axis, radius=ring_radius, segments=96,
+            basis=handle_matrix
         ):
           self._make_axis_geom(start, end, color, radius=ring_thickness)
     else:
@@ -876,7 +950,7 @@ class SceneAuthoringViewerPlugin:
       if self._gizmo_mode == "scale":
         radius *= 1.15
       for axis, (_, end) in gizmo.axis_segments(
-          display_origin, length, basis=matrix
+          display_origin, length, basis=handle_matrix
       ).items():
         color = gizmo.AXIS_COLORS[axis]
         if axis == self._gizmo_axis:
@@ -954,17 +1028,20 @@ class SceneAuthoringViewerPlugin:
         # Pick only a small screen-space neighborhood around a visible
         # handle. A fixed world-space threshold becomes huge after zooming.
         pick_threshold = max(0.0025, length * 0.04)
+        handle_matrix = self._gizmo_handle_matrix(
+            self._preview_world_matrix(node)
+        )
         if self._gizmo_mode == "rotate":
           axis = gizmo.closest_rotation_axis(
               ray[0], ray[1], display_origin, radius=length * 0.84,
               threshold=pick_threshold,
-              basis=self._preview_world_matrix(node),
+              basis=handle_matrix,
           )
         else:
           axis = gizmo.closest_axis(
               ray[0], ray[1], display_origin, length=length,
               threshold=pick_threshold,
-              basis=self._preview_world_matrix(node),
+              basis=handle_matrix,
           )
         self.state.hovered_axis = axis
         if axis is not None:
@@ -1069,6 +1146,18 @@ class SceneAuthoringViewerPlugin:
       node = self._scene_nodes[key]
       self.state.status = f"Inspected {node.kind}: {node.name or '(unnamed)'}"
 
+  def _handle_scene_item_click(self, node):
+    if imgui.IsItemHovered() and imgui.IsMouseDoubleClicked(
+        imgui.MouseButton.Left
+    ):
+      self._begin_rename(node)
+      return
+    if imgui.IsItemClicked(imgui.MouseButton.Left):
+      self._select_inspected_node(node.key)
+      # A single click in the Scene Tree selects the node and activates its
+      # transform gizmo. Double-click is reserved for renaming.
+      self._activate_gizmo_node(node)
+
   def _draw_scene_node(self, key):
     node = self._scene_nodes.get(key)
     if node is None:
@@ -1081,12 +1170,7 @@ class SceneAuthoringViewerPlugin:
       if selected:
         flags |= int(imgui.TreeNodeFlags.Selected)
       opened = imgui.TreeNodeEx(node.key, flags, node.label)
-      if imgui.IsItemClicked(imgui.MouseButton.Left):
-        self._select_inspected_node(node.key)
-        # Scene Tree selection is also an authoring selection. This lets the
-        # user edit a body directly with P/R/S instead of first selecting a
-        # child geom in the viewport.
-        self._activate_gizmo_node(node)
+      self._handle_scene_item_click(node)
       if node.kind == "body":
         self._draw_create_context(node)
       if opened:
@@ -1095,9 +1179,8 @@ class SceneAuthoringViewerPlugin:
         imgui.TreePop()
       return
 
-    if imgui.Selectable(f"{node.label}##{node.key}", selected):
-      self._select_inspected_node(node.key)
-      self._activate_gizmo_node(node)
+    imgui.Selectable(f"{node.label}##{node.key}", selected)
+    self._handle_scene_item_click(node)
     if node.kind == "body":
       self._draw_create_context(node)
 
@@ -1786,6 +1869,7 @@ class SceneAuthoringViewerPlugin:
 
     self._draw_save_popup()
     self._draw_create_dialog()
+    self._draw_rename_popup()
     imgui.End()
 
   @studio_messages.handler
