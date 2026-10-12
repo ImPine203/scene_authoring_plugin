@@ -22,6 +22,24 @@ class SceneAuthoringViewerApp(viewer_app.ViewerApp):
       return
     super().handle_keyboard_events()
 
+  def refresh_native_renderer_for_preview(self) -> bool:
+    """Rebuilds native render resources after an in-place preview edit.
+
+    Studio's Filament renderer uploads model meshes when it is initialized.
+    The public Viewer API updates transforms every frame, but it does not
+    expose a mesh-buffer update operation. Scene Authoring uses this hook for
+    scale previews; it is a no-op for non-native viewers.
+    """
+    viewer = self.authoring_plugin.viewer
+    if viewer is None:
+      return False
+    renderer = getattr(viewer, "_viewer", None)
+    init_renderer = getattr(renderer, "InitRenderer", None)
+    if init_renderer is None:
+      return False
+    init_renderer(viewer.model)
+    return True
+
   @messages.handler(priority=messages.Priority.CRITICAL)
   def _on_model(self, event: messages.ModelEvent) -> bool:
     # ViewerApp._on_model resets StepControl to UNPAUSED. That default is

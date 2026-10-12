@@ -6,6 +6,7 @@ from pathlib import Path
 import mujoco
 import numpy as np
 from mujoco.experimental.studio import messages as studio_messages
+from mujoco.experimental.studio import sim
 
 from scene_authoring import messages
 from scene_authoring.history import Command, CommandHistory
@@ -30,6 +31,7 @@ class SceneAuthoringSimPlugin:
     self.handle = None
     self.history = CommandHistory()
     self.authored: dict[str, PrimitiveDescription] = {}
+    self._model_dirty = False
 
   def attach_handle(self, handle):
     self.handle = handle
@@ -75,7 +77,177 @@ class SceneAuthoringSimPlugin:
       if len(state) == new_state_size:
         mujoco.mj_setState(self.model, self.data, state, state_sig)
     mujoco.mj_forward(self.model, self.data)
+    self._model_dirty = False
     self._publish_model()
+
+  def _can_fast_edit(self, kind, values):
+    if kind not in ("body", "geom", "site", "camera"):
+      return False
+    if not values:
+      return False
+    return set(values).issubset({"position", "quaternion", "size"})
+
+  def _model_object_id(self, kind, node):
+    if not node.name:
+      return -1
+    object_types = {
+        "body": mujoco.mjtObj.mjOBJ_BODY,
+        "geom": mujoco.mjtObj.mjOBJ_GEOM,
+        "site": mujoco.mjtObj.mjOBJ_SITE,
+        "camera": mujoco.mjtObj.mjOBJ_CAMERA,
+    }
+    return int(mujoco.mj_name2id(
+        self.model, object_types[kind], str(node.name)
+    ))
+
+  def _apply_mesh_runtime_pose(self, kind, node, object_id, values, before):
+    """Maps an MJCF mesh pose to MuJoCo's compiled mesh pose."""
+    model = self.model
+    old_position = np.asarray(before["position"], dtype=np.float64)
+    old_quaternion = np.asarray(before["quaternion"], dtype=np.float64)
+    new_position = np.asarray(
+        values.get("position", tuple(float(v) for v in node.pos)),
+        dtype=np.float64,
+    )
+    new_quaternion = np.asarray(
+        values.get("quaternion", tuple(float(v) for v in node.quat)),
+        dtype=np.float64,
+    )
+    mujoco.mju_normalize4(new_quaternion)
+    old_logical_matrix = np.empty((3, 3), dtype=np.float64)
+    new_logical_matrix = np.empty((3, 3), dtype=np.float64)
+    mujoco.mju_quat2Mat(old_logical_matrix.reshape(-1), old_quaternion)
+    mujoco.mju_quat2Mat(new_logical_matrix.reshape(-1), new_quaternion)
+
+    if kind == "geom":
+      compiled_position = model.geom_pos[object_id].copy()
+      compiled_quaternion = model.geom_quat[object_id].copy()
+      mesh_id = int(model.geom_dataid[object_id])
+    else:
+      compiled_position = model.site_pos[object_id].copy()
+      compiled_quaternion = model.site_quat[object_id].copy()
+      mesh_id = int(model.site_dataid[object_id])
+    compiled_matrix = np.empty((3, 3), dtype=np.float64)
+    mujoco.mju_quat2Mat(compiled_matrix.reshape(-1), compiled_quaternion)
+
+    asset_position = old_logical_matrix.T @ compiled_position - (
+        old_logical_matrix.T @ old_position
+    )
+    asset_matrix = old_logical_matrix.T @ compiled_matrix
+    # Scale is compensated through mesh.refpos below, so the visible mesh
+    # keeps the current compiled pose while its dimensions change.
+    new_compiled_position = new_position + new_logical_matrix @ asset_position
+    new_compiled_matrix = new_logical_matrix @ asset_matrix
+    new_compiled_quaternion = np.empty(4, dtype=np.float64)
+    mujoco.mju_mat2Quat(
+        new_compiled_quaternion, new_compiled_matrix.reshape(-1)
+    )
+
+    if kind == "geom":
+      model.geom_pos[object_id] = new_compiled_position
+      model.geom_quat[object_id] = new_compiled_quaternion
+    else:
+      model.site_pos[object_id] = new_compiled_position
+      model.site_quat[object_id] = new_compiled_quaternion
+    if "size" in values:
+      old_scale = np.asarray(model.mesh_scale[mesh_id], dtype=np.float64).copy()
+      new_scale = np.asarray(values["size"], dtype=np.float64)
+      self._apply_mesh_vertex_scale(mesh_id, old_scale, new_scale)
+      model.mesh_scale[mesh_id] = values["size"]
+
+  def _apply_mesh_vertex_scale(self, mesh_id, old_scale, new_scale):
+    """Patches render-time mesh buffers until the next authoritative compile."""
+    if old_scale.shape != (3,) or new_scale.shape != (3,):
+      return
+    ratio = np.ones(3, dtype=np.float64)
+    nonzero = np.abs(old_scale) > 1e-9
+    ratio[nonzero] = new_scale[nonzero] / old_scale[nonzero]
+    vertex_adr = int(self.model.mesh_vertadr[mesh_id])
+    vertex_count = int(self.model.mesh_vertnum[mesh_id])
+    vertices = np.asarray(
+        self.model.mesh_vert[vertex_adr:vertex_adr + vertex_count],
+        dtype=np.float64,
+    ).reshape(-1, 3)
+    if not len(vertices):
+      return
+    pivot = vertices.mean(axis=0)
+    scaled = pivot + (vertices - pivot) * ratio
+    self.model.mesh_vert[
+        vertex_adr:vertex_adr + vertex_count
+    ] = scaled.astype(self.model.mesh_vert.dtype, copy=False)
+
+    normal_adr = int(self.model.mesh_normaladr[mesh_id])
+    normal_count = int(self.model.mesh_normalnum[mesh_id])
+    if normal_count:
+      normals = np.asarray(
+          self.model.mesh_normal[
+              normal_adr:normal_adr + normal_count
+          ],
+          dtype=np.float64,
+      ).reshape(-1, 3)
+      inv_ratio = np.divide(
+          1.0, ratio, out=np.zeros(3), where=np.abs(ratio) > 1e-9
+      )
+      transformed = normals * inv_ratio
+      lengths = np.linalg.norm(transformed, axis=1, keepdims=True)
+      transformed = np.divide(
+          transformed, lengths, out=np.zeros_like(transformed),
+          where=lengths > 1e-9,
+      )
+      self.model.mesh_normal[
+          normal_adr:normal_adr + normal_count
+      ] = transformed.astype(self.model.mesh_normal.dtype, copy=False)
+
+  def _apply_fast_edit(self, kind, node, values, before):
+    """Updates the paused runtime model without rebuilding the full model."""
+    object_id = self._model_object_id(kind, node)
+    if object_id < 0:
+      raise ValueError("Fast editing requires a named MJCF element")
+
+    if kind == "body":
+      if "position" in values:
+        self.model.body_pos[object_id] = values["position"]
+      if "quaternion" in values:
+        self.model.body_quat[object_id] = values["quaternion"]
+    elif kind == "geom":
+      if int(node.type) == int(mujoco.mjtGeom.mjGEOM_MESH):
+        self._apply_mesh_runtime_pose(
+            kind, node, object_id, values, before
+        )
+      else:
+        if "position" in values:
+          self.model.geom_pos[object_id] = values["position"]
+        if "quaternion" in values:
+          self.model.geom_quat[object_id] = values["quaternion"]
+        if "size" in values:
+          self.model.geom_size[object_id] = values["size"]
+    elif kind == "site":
+      if int(node.type) == int(mujoco.mjtGeom.mjGEOM_MESH):
+        self._apply_mesh_runtime_pose(
+            kind, node, object_id, values, before
+        )
+      else:
+        if "position" in values:
+          self.model.site_pos[object_id] = values["position"]
+        if "quaternion" in values:
+          self.model.site_quat[object_id] = values["quaternion"]
+        if "size" in values:
+          self.model.site_size[object_id] = values["size"]
+    elif kind == "camera":
+      if "position" in values:
+        self.model.cam_pos[object_id] = values["position"]
+      if "quaternion" in values:
+        self.model.cam_quat[object_id] = values["quaternion"]
+
+    mujoco.mj_forward(self.model, self.data)
+    self._model_dirty = True
+    self._publish_model()
+
+  @studio_messages.handler(priority=studio_messages.Priority.LIBRARY)
+  def _on_step_control(self, event: studio_messages.StepControlSnapshot) -> bool:
+    if event.pause_state == sim.PauseState.UNPAUSED and self._model_dirty:
+      self._recompile()
+    return False
 
   def _record(self, command: Command):
     self.history.push(command)
@@ -90,6 +262,7 @@ class SceneAuthoringSimPlugin:
       self.source_path = event.path
       self.authored.clear()
       self.history.clear()
+      self._model_dirty = False
       self.publish_scene_scan()
     except Exception as exc:  # pylint: disable=broad-except
       print(f"Scene Authoring could not load {event.path}: {exc}")
@@ -169,6 +342,64 @@ class SceneAuthoringSimPlugin:
         return mesh
     return None
 
+  def _mesh_scale(self, node):
+    mesh_name = str(getattr(node, "meshname", "") or "")
+    mesh = self._mesh_asset(mesh_name)
+    if mesh is None:
+      return (1.0, 1.0, 1.0)
+    return tuple(float(value) for value in mesh.scale)
+
+  def _preserve_mesh_center(self, kind, node, values, before):
+    """Adjusts mesh refpos so scaling does not move the visible mesh center."""
+    if (
+        "size" not in values
+        or int(node.type) != int(mujoco.mjtGeom.mjGEOM_MESH)
+    ):
+      return
+    mesh = self._mesh_asset(getattr(node, "meshname", ""))
+    if mesh is None:
+      return
+    object_id = self._model_object_id(kind, node)
+    if object_id < 0:
+      return
+
+    old_size = np.asarray(before.get("size", mesh.scale), dtype=np.float64)
+    new_size = np.asarray(values["size"], dtype=np.float64)
+    if old_size.shape != (3,) or new_size.shape != (3,):
+      return
+
+    if kind == "geom":
+      compiled_position = self.model.geom_pos[object_id]
+      mesh_id = int(self.model.geom_dataid[object_id])
+    else:
+      compiled_position = self.model.site_pos[object_id]
+      mesh_id = int(self.model.site_dataid[object_id])
+    old_quaternion = np.asarray(before["quaternion"], dtype=np.float64)
+    old_position = np.asarray(before["position"], dtype=np.float64)
+    old_matrix = np.empty((3, 3), dtype=np.float64)
+    mujoco.mju_quat2Mat(old_matrix.reshape(-1), old_quaternion)
+    desired_asset_position = old_matrix.T @ (
+        np.asarray(compiled_position) - old_position
+    )
+
+    # Recover the unscaled mesh center from the current compiled asset data,
+    # then choose a refpos that retains the old asset offset at the new scale.
+    current_scale = np.asarray(self.model.mesh_scale[mesh_id], dtype=np.float64)
+    current_refpos = np.asarray(mesh.refpos, dtype=np.float64)
+    raw_center = current_refpos.copy()
+    nonzero = np.abs(current_scale) > 1e-9
+    raw_center[nonzero] += (
+        np.asarray(self.model.mesh_pos[mesh_id], dtype=np.float64)[nonzero]
+        / current_scale[nonzero]
+    )
+    new_refpos = current_refpos.copy()
+    new_nonzero = np.abs(new_size) > 1e-9
+    new_refpos[new_nonzero] = (
+        raw_center[new_nonzero]
+        - desired_asset_position[new_nonzero] / new_size[new_nonzero]
+    )
+    mesh.refpos = list(float(value) for value in new_refpos)
+
   def _add_node(self, kind, parent_path, name, values):
     parent = self._body_at_path(tuple(parent_path))
     position = list(values.get("position", (0.0, 0.0, 0.0)))
@@ -199,6 +430,9 @@ class SceneAuthoringSimPlugin:
           )
         if self._mesh_asset(meshname) is None:
           raise ValueError(f"Mesh asset not found: {meshname}")
+        mesh = self._mesh_asset(meshname)
+        if "size" in values:
+          mesh.scale = list(values["size"])
       return parent.add_geom(
           name=name,
           type=type_id,
@@ -239,7 +473,11 @@ class SceneAuthoringSimPlugin:
     if kind == "body":
       values["mass"] = float(node.mass)
     elif kind in ("geom", "site"):
-      values["size"] = tuple(float(v) for v in node.size)
+      values["size"] = (
+          self._mesh_scale(node)
+          if int(node.type) == int(mujoco.mjtGeom.mjGEOM_MESH)
+          else tuple(float(v) for v in node.size)
+      )
       values["rgba"] = tuple(float(v) for v in node.rgba)
       if kind == "geom":
         values["mass"] = float(node.mass)
@@ -263,7 +501,13 @@ class SceneAuthoringSimPlugin:
       node.mass = float(values["mass"])
     elif kind in ("geom", "site"):
       if "size" in values:
-        node.size = list(values["size"])
+        if int(node.type) == int(mujoco.mjtGeom.mjGEOM_MESH):
+          mesh = self._mesh_asset(getattr(node, "meshname", ""))
+          if mesh is None:
+            raise ValueError("Mesh geom has no valid mesh asset")
+          mesh.scale = list(values["size"])
+        else:
+          node.size = list(values["size"])
       if "rgba" in values:
         node.rgba = list(values["rgba"])
       if kind == "geom" and "mass" in values:
@@ -356,10 +600,14 @@ class SceneAuthoringSimPlugin:
 
   @studio_messages.handler
   def _on_edit_node(self, event: messages.EditNodeEvent) -> bool:
+    before_spec = None
+    before_authored = None
     try:
       node = self._resolve_node(
           event.kind, event.target_path, event.element_index, event.target_name
       )
+      before_spec = self.spec.copy()
+      before_authored = dict(self.authored)
       before = self._node_values(event.kind, node)
       scale_only = (
           event.kind in ("geom", "site")
@@ -370,6 +618,7 @@ class SceneAuthoringSimPlugin:
       preserved_position = tuple(float(v) for v in node.pos)
       preserved_quaternion = tuple(float(v) for v in node.quat)
       self._apply_node_values(event.kind, node, event.values)
+      self._preserve_mesh_center(event.kind, node, event.values, before)
       if scale_only:
         # Scaling changes the shape only. Keep the local pose explicit even if
         # a future MjSpec implementation normalizes geometry attributes.
@@ -377,7 +626,10 @@ class SceneAuthoringSimPlugin:
         node.quat = list(preserved_quaternion)
       after = self._node_values(event.kind, node)
       self._refresh_authored()
-      self._recompile()
+      if self._can_fast_edit(event.kind, event.values):
+        self._apply_fast_edit(event.kind, node, event.values, before)
+      else:
+        self._recompile()
       if event.kind == "body":
         body_name = str(event.values.get("name", node.name or ""))
         if body_name:
@@ -386,15 +638,33 @@ class SceneAuthoringSimPlugin:
               event.values.get("position", tuple(node.pos)),
               event.values.get("quaternion", tuple(node.quat)),
           )
-      self._record(Command("edit_node", {
+      before_pose = None
+      after_pose = None
+      if event.kind == "body":
+        before_pose = {
+            "name": str(before.get("name", "")),
+            "position": tuple(before["position"]),
+            "quaternion": tuple(before["quaternion"]),
+        }
+        after_pose = {
+            "name": str(after.get("name", "")),
+            "position": tuple(after["position"]),
+            "quaternion": tuple(after["quaternion"]),
+        }
+      self._record(Command("edit_spec", {
           "kind": event.kind,
-          "target_path": tuple(event.target_path),
-          "element_index": event.element_index,
-          "before": before,
-          "after": after,
+          "before_spec": before_spec,
+          "after_spec": self.spec.copy(),
+          "before_authored": before_authored,
+          "after_authored": dict(self.authored),
+          "before_pose": before_pose,
+          "after_pose": after_pose,
       }))
       self._result(event, "edit", True, model_changed=True)
     except Exception as exc:  # pylint: disable=broad-except
+      if before_spec is not None and before_authored is not None:
+        self.spec = before_spec
+        self.authored = before_authored
       self._result(event, "edit", False, message=str(exc))
     return True
 
@@ -447,7 +717,9 @@ class SceneAuthoringSimPlugin:
       self._result(event, "transform", False, message="Unknown authored object")
       return True
     old_position = tuple(float(v) for v in body.pos)
+    old_quaternion = tuple(float(v) for v in body.quat)
     body.pos = list(event.position)
+    body.quat = list(event.quaternion)
     try:
       self._recompile()
       self._set_body_pose(event.object_name, event.position, event.quaternion)
@@ -464,12 +736,14 @@ class SceneAuthoringSimPlugin:
           "name": event.object_name,
           "before": old_position,
           "after": event.position,
+          "before_quaternion": old_quaternion,
           "quaternion": event.quaternion,
       }))
       self._result(event, "transform", True,
                    object_name=event.object_name, model_changed=True)
     except Exception as exc:  # pylint: disable=broad-except
       body.pos = list(old_position)
+      body.quat = list(old_quaternion)
       self._result(event, "transform", False, message=str(exc))
     return True
 
@@ -545,7 +819,13 @@ class SceneAuthoringSimPlugin:
       if body is None:
         raise ValueError("Unknown authored object")
       position = payload["after"] if forward else payload["before"]
+      quaternion = payload.get("quaternion", (1.0, 0.0, 0.0, 0.0))
+      if not forward:
+        quaternion = payload.get(
+            "before_quaternion", (1.0, 0.0, 0.0, 0.0)
+        )
       body.pos = list(position)
+      body.quat = list(quaternion)
       primitive = self.authored[name]
       self.authored[name] = PrimitiveDescription(
           name=primitive.name,
@@ -553,6 +833,14 @@ class SceneAuthoringSimPlugin:
           position=tuple(position), size=primitive.size,
           mass=primitive.mass, dynamic=primitive.dynamic,
       )
+    elif command.kind == "edit_spec":
+      snapshot = payload["after_spec"] if forward else payload["before_spec"]
+      authored = (
+          payload["after_authored"] if forward
+          else payload["before_authored"]
+      )
+      self.spec = snapshot.copy()
+      self.authored = dict(authored)
     elif command.kind == "add_node":
       if forward:
         self._add_node(
@@ -582,7 +870,21 @@ class SceneAuthoringSimPlugin:
       if command.kind == "transform":
         payload = command.payload
         position = payload["after"] if forward else payload["before"]
-        self._set_body_pose(payload["name"], position, payload["quaternion"])
+        quaternion = payload.get("quaternion", (1.0, 0.0, 0.0, 0.0))
+        if not forward:
+          quaternion = payload.get(
+              "before_quaternion", (1.0, 0.0, 0.0, 0.0)
+          )
+        self._set_body_pose(payload["name"], position, quaternion)
+      elif command.kind == "edit_spec":
+        pose = (
+            command.payload["after_pose"] if forward
+            else command.payload["before_pose"]
+        )
+        if pose is not None and pose["name"]:
+          self._set_body_pose(
+              pose["name"], pose["position"], pose["quaternion"]
+          )
       self._result(event, "redo" if forward else "undo", True, model_changed=True)
     except Exception as exc:  # pylint: disable=broad-except
       self._result(event, "redo" if forward else "undo", False, message=str(exc))

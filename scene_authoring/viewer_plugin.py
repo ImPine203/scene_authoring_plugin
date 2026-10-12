@@ -60,6 +60,9 @@ class SceneAuthoringViewerPlugin:
     self._request_ids = itertools.count(1)
     self._owned_geoms = []
     self._mesh_preview_original = None
+    self._object_preview_original = None
+    self._body_preview_original = None
+    self._native_preview_size_signature = None
     self._last_mouse_ray = None
     self._drag_start_ray = None
     self._scene_nodes = {}
@@ -72,6 +75,7 @@ class SceneAuthoringViewerPlugin:
     self._pending_create_name = None
     self._property_drafts = {}
     self._property_vector_buffers = {}
+    self._scene_height = 260.0
     self._property_height = 360.0
     self._create_error = ""
     self._create_dialog_pending = False
@@ -112,6 +116,7 @@ class SceneAuthoringViewerPlugin:
     self._gizmo_preview_local_position = None
     self._gizmo_preview_quaternion = None
     self._gizmo_preview_size = None
+    self._native_preview_size_signature = None
 
   def _next_request(self):
     request_id = next(self._request_ids)
@@ -198,6 +203,9 @@ class SceneAuthoringViewerPlugin:
   def _on_model(self, event: studio_messages.ModelEvent) -> bool:
     del event
     self._mesh_preview_original = None
+    self._object_preview_original = None
+    self._body_preview_original = None
+    self._native_preview_size_signature = None
     self._pause_after_model_update = self._authoring_pause_lock
     self._remove_owned_geoms()
     self.state.selected_body_id = self._resolve_selected_body()
@@ -431,7 +439,7 @@ class SceneAuthoringViewerPlugin:
     )
     return camera_position, forward, up, right
 
-  def _gizmo_length(self, origin):
+  def _gizmo_length(self, origin, node=None):
     """Chooses a gizmo size in world units for a stable screen size."""
     io = imgui.GetIO()
     height = max(float(io.DisplaySize.y), 1.0)
@@ -452,8 +460,17 @@ class SceneAuthoringViewerPlugin:
     else:
       world_height = frustum_height * depth / max(float(zclip[0]), 1e-6)
     # Keep the handle easy to grab without making its size depend on the
-    # object's distance from the global origin.
-    return max(0.02, world_height * 185.0 / height)
+    # object's distance from the global origin. Meshes can occupy a much
+    # larger visual area than their logical geom size, so use a smaller
+    # gizmo for them while keeping primitive handles unchanged.
+    mesh_scale = 1.0
+    if (
+        node is not None
+        and node.kind in ("geom", "site")
+        and int(node.type_id) == int(mujoco.mjtGeom.mjGEOM_MESH)
+    ):
+      mesh_scale = 0.68
+    return max(0.02, world_height * 185.0 / height * mesh_scale)
 
   def _node_bound_radius(self, node):
     """Returns a conservative radius for placing the gizmo outside a node."""
@@ -525,7 +542,7 @@ class SceneAuthoringViewerPlugin:
   def _gizmo_display_origin(self, node, origin, length=None):
     """Places the visual handle on the camera-facing side of the selection."""
     if length is None:
-      length = self._gizmo_length(origin)
+      length = self._gizmo_length(origin, node)
     camera_position, forward, _, _ = self._camera_frame()
     origin = np.asarray(origin, dtype=np.float64)
     to_camera = camera_position - origin
@@ -676,7 +693,12 @@ class SceneAuthoringViewerPlugin:
     return np.asarray(object_matrix, dtype=np.float64).reshape(3, 3)
 
   def _clear_gizmo_drag(self):
+    refresh_scale_preview = self._gizmo_mode == "scale"
     self._restore_mesh_preview()
+    self._restore_object_preview()
+    self._restore_body_preview()
+    if refresh_scale_preview:
+      self._refresh_native_renderer_for_preview(force=True)
     self._gizmo_axis = None
     self._gizmo_start_ray = None
     self._gizmo_start_mouse = None
@@ -694,6 +716,191 @@ class SceneAuthoringViewerPlugin:
     self._gizmo_preview_quaternion = None
     self._gizmo_preview_size = None
     self._mesh_preview_original = None
+    self._object_preview_original = None
+    self._body_preview_original = None
+    self._native_preview_size_signature = None
+
+  def _refresh_native_renderer_for_preview(self, force=False):
+    """Refreshes Filament resources after changing render-time geometry."""
+    if self.viewer is None or self.app is None:
+      return
+    if self._gizmo_mode != "scale":
+      return
+    size = self._gizmo_preview_size
+    signature = None if size is None else tuple(
+        round(float(value), 12) for value in np.asarray(size).reshape(-1)
+    )
+    if not force and signature == self._native_preview_size_signature:
+      return
+    try:
+      refreshed = self.app.refresh_native_renderer_for_preview()
+    except (AttributeError, RuntimeError):
+      refreshed = False
+    if refreshed:
+      self._native_preview_size_signature = signature
+
+  def _capture_runtime_preview(self, node):
+    """Captures model arrays used by the frame-local gizmo preview."""
+    self._object_preview_original = None
+    self._body_preview_original = None
+    if self.viewer is None:
+      return
+
+    object_id = self._model_id_for_node(node)
+    if object_id < 0:
+      return
+    model = self.viewer.model
+
+    if node.kind in ("geom", "site", "camera"):
+      if node.kind == "geom":
+        original = (
+            id(model), node.kind, object_id,
+            model.geom_pos[object_id].copy(),
+            model.geom_quat[object_id].copy(),
+            model.geom_size[object_id].copy(),
+        )
+      elif node.kind == "site":
+        original = (
+            id(model), node.kind, object_id,
+            model.site_pos[object_id].copy(),
+            model.site_quat[object_id].copy(),
+            model.site_size[object_id].copy(),
+        )
+      else:
+        original = (
+            id(model), node.kind, object_id,
+            model.cam_pos[object_id].copy(),
+            model.cam_quat[object_id].copy(),
+            None,
+        )
+      self._object_preview_original = original
+      return
+
+    if node.kind != "body":
+      return
+
+    # A free joint owns the body's world pose in qpos. Other bodies use the
+    # local body pose arrays. Capturing the correct source avoids moving every
+    # child geom through a stale or mixed representation during preview.
+    free_joint_id = -1
+    for joint_id in range(model.njnt):
+      if int(model.jnt_bodyid[joint_id]) == object_id and int(
+          model.jnt_type[joint_id]
+      ) == int(mujoco.mjtJoint.mjJNT_FREE):
+        free_joint_id = joint_id
+        break
+    if free_joint_id >= 0:
+      qpos_adr = int(model.jnt_qposadr[free_joint_id])
+      self._body_preview_original = (
+          id(model), object_id, "free", qpos_adr,
+          self.viewer.data.qpos[qpos_adr:qpos_adr + 7].copy(),
+      )
+    else:
+      self._body_preview_original = (
+          id(model), object_id, "body",
+          model.body_pos[object_id].copy(),
+          model.body_quat[object_id].copy(),
+      )
+
+  def _restore_object_preview(self):
+    if self.viewer is None or self._object_preview_original is None:
+      return
+    model_id, kind, object_id, position, quaternion, size = (
+        self._object_preview_original
+    )
+    model = self.viewer.model
+    if id(model) != model_id:
+      return
+    if kind == "geom":
+      model.geom_pos[object_id] = position
+      model.geom_quat[object_id] = quaternion
+      model.geom_size[object_id] = size
+    elif kind == "site":
+      model.site_pos[object_id] = position
+      model.site_quat[object_id] = quaternion
+      model.site_size[object_id] = size
+    else:
+      model.cam_pos[object_id] = position
+      model.cam_quat[object_id] = quaternion
+    mujoco.mj_forward(model, self.viewer.data)
+
+  def _restore_body_preview(self):
+    if self.viewer is None or self._body_preview_original is None:
+      return
+    original = self._body_preview_original
+    model = self.viewer.model
+    if id(model) != original[0]:
+      return
+    object_id = original[1]
+    if original[2] == "free":
+      qpos_adr = original[3]
+      self.viewer.data.qpos[qpos_adr:qpos_adr + 7] = original[4]
+    else:
+      model.body_pos[object_id] = original[3]
+      model.body_quat[object_id] = original[4]
+    mujoco.mj_forward(model, self.viewer.data)
+
+  def _apply_runtime_preview(self, node):
+    """Applies the current drag pose to the live viewer without recompiling."""
+    if self.viewer is None:
+      return
+    model = self.viewer.model
+
+    if node.kind in ("geom", "site", "camera"):
+      if node.kind in ("geom", "site") and int(node.type_id) == int(
+          mujoco.mjtGeom.mjGEOM_MESH
+      ):
+        self._apply_mesh_preview(node)
+        return
+      if self._object_preview_original is None:
+        return
+      model_id, kind, object_id, _, _, _ = self._object_preview_original
+      if id(model) != model_id or kind != node.kind:
+        return
+      position = np.asarray(self._gizmo_preview_local_position, dtype=np.float64)
+      quaternion = np.asarray(self._gizmo_preview_quaternion, dtype=np.float64)
+      if kind == "geom":
+        model.geom_pos[object_id] = position
+        model.geom_quat[object_id] = quaternion
+        model.geom_size[object_id] = np.asarray(
+            self._gizmo_preview_size, dtype=np.float64
+        )
+      elif kind == "site":
+        model.site_pos[object_id] = position
+        model.site_quat[object_id] = quaternion
+        model.site_size[object_id] = np.asarray(
+            self._gizmo_preview_size, dtype=np.float64
+        )
+      else:
+        model.cam_pos[object_id] = position
+        model.cam_quat[object_id] = quaternion
+      mujoco.mj_forward(model, self.viewer.data)
+      if self._gizmo_mode == "scale":
+        self._refresh_native_renderer_for_preview()
+      return
+
+    if node.kind != "body" or self._body_preview_original is None:
+      return
+    model_id, object_id, pose_kind = self._body_preview_original[:3]
+    if id(model) != model_id:
+      return
+    if pose_kind == "free":
+      qpos_adr = self._body_preview_original[3]
+      world_matrix = self._preview_world_matrix(node)
+      world_quaternion = np.empty(4, dtype=np.float64)
+      mujoco.mju_mat2Quat(world_quaternion, world_matrix.reshape(-1))
+      self.viewer.data.qpos[qpos_adr:qpos_adr + 3] = (
+          self._gizmo_preview_world_position
+      )
+      self.viewer.data.qpos[qpos_adr + 3:qpos_adr + 7] = world_quaternion
+    else:
+      model.body_pos[object_id] = np.asarray(
+          self._gizmo_preview_local_position, dtype=np.float64
+      )
+      model.body_quat[object_id] = np.asarray(
+          self._gizmo_preview_quaternion, dtype=np.float64
+      )
+    mujoco.mj_forward(model, self.viewer.data)
 
   def _capture_mesh_preview(self, node):
     if (
@@ -713,6 +920,20 @@ class SceneAuthoringViewerPlugin:
     mujoco.mju_quat2Mat(
         logical_matrix.reshape(-1), np.asarray(node.quaternion, dtype=np.float64)
     )
+    mesh_id = int(
+        model.geom_dataid[object_id]
+        if node.kind == "geom" else model.site_dataid[object_id]
+    )
+    vertex_adr = int(model.mesh_vertadr[mesh_id])
+    vertex_count = int(model.mesh_vertnum[mesh_id])
+    normal_adr = int(model.mesh_normaladr[mesh_id])
+    normal_count = int(model.mesh_normalnum[mesh_id])
+    vertices = model.mesh_vert[
+        vertex_adr:vertex_adr + vertex_count
+    ].copy()
+    normals = model.mesh_normal[
+        normal_adr:normal_adr + normal_count
+    ].copy()
     if node.kind == "geom":
       compiled_position = model.geom_pos[object_id].copy()
       compiled_matrix = np.empty((3, 3), dtype=np.float64)
@@ -734,8 +955,12 @@ class SceneAuthoringViewerPlugin:
           compiled_position,
           model.geom_quat[object_id].copy(),
           model.geom_size[object_id].copy(),
+          mesh_id,
+          model.mesh_scale[mesh_id].copy(),
           asset_position,
           asset_matrix,
+          vertex_adr, vertex_count, vertices,
+          normal_adr, normal_count, normals,
       )
     else:
       compiled_position = model.site_pos[object_id].copy()
@@ -752,16 +977,22 @@ class SceneAuthoringViewerPlugin:
           compiled_position,
           model.site_quat[object_id].copy(),
           model.site_size[object_id].copy(),
+          mesh_id,
+          model.mesh_scale[mesh_id].copy(),
           asset_position,
           asset_matrix,
+          vertex_adr, vertex_count, vertices,
+          normal_adr, normal_count, normals,
       )
 
   def _restore_mesh_preview(self):
     if self.viewer is None or self._mesh_preview_original is None:
       return
-    model_id, kind, object_id, position, quaternion, size, _, _ = (
-        self._mesh_preview_original
-    )
+    (
+        model_id, kind, object_id, position, quaternion, size,
+        mesh_id, mesh_scale, _, _, vertex_adr, vertex_count,
+        vertices, normal_adr, normal_count, normals,
+    ) = self._mesh_preview_original
     model = self.viewer.model
     if id(model) != model_id:
       return
@@ -773,14 +1004,50 @@ class SceneAuthoringViewerPlugin:
       model.site_pos[object_id] = position
       model.site_quat[object_id] = quaternion
       model.site_size[object_id] = size
+    model.mesh_scale[mesh_id] = mesh_scale
+    model.mesh_vert[vertex_adr:vertex_adr + vertex_count] = vertices
+    if normal_count:
+      model.mesh_normal[normal_adr:normal_adr + normal_count] = normals
     mujoco.mj_forward(model, self.viewer.data)
+
+  def _apply_mesh_vertex_preview(self, model, ratio):
+    """Scales uploaded mesh data around its current visual center."""
+    if self._mesh_preview_original is None:
+      return
+    (
+        _, _, _, _, _, _, _, _, _, _, vertex_adr, vertex_count,
+        original_vertices, normal_adr, normal_count, original_normals,
+    ) = self._mesh_preview_original
+    vertices = np.asarray(original_vertices, dtype=np.float64).reshape(-1, 3)
+    scale_ratio = np.asarray(ratio, dtype=np.float64)
+    if len(vertices):
+      pivot = vertices.mean(axis=0)
+      scaled = pivot + (vertices - pivot) * scale_ratio
+      model.mesh_vert[
+          vertex_adr:vertex_adr + vertex_count
+      ] = scaled.astype(model.mesh_vert.dtype, copy=False)
+    if normal_count:
+      normals = np.asarray(original_normals, dtype=np.float64).reshape(-1, 3)
+      inv_ratio = np.divide(
+          1.0, scale_ratio, out=np.zeros(3), where=np.abs(scale_ratio) > 1e-9
+      )
+      transformed = normals * inv_ratio
+      lengths = np.linalg.norm(transformed, axis=1, keepdims=True)
+      transformed = np.divide(
+          transformed, lengths, out=np.zeros_like(transformed),
+          where=lengths > 1e-9,
+      )
+      model.mesh_normal[
+          normal_adr:normal_adr + normal_count
+      ] = transformed.astype(model.mesh_normal.dtype, copy=False)
 
   def _apply_mesh_preview(self, node):
     if self.viewer is None or self._mesh_preview_original is None:
       return
     (
         model_id, kind, object_id, _, _, original_size,
-        asset_position, asset_matrix,
+        mesh_id, original_mesh_scale, asset_position, asset_matrix,
+        _, _, _, _, _, _,
     ) = self._mesh_preview_original
     model = self.viewer.model
     if id(model) != model_id or node.kind != kind:
@@ -791,7 +1058,6 @@ class SceneAuthoringViewerPlugin:
         logical_matrix.reshape(-1),
         np.asarray(self._gizmo_preview_quaternion, dtype=np.float64),
     )
-    compiled_position = position + logical_matrix @ asset_position
     compiled_matrix = logical_matrix @ asset_matrix
     quaternion = np.empty(4, dtype=np.float64)
     mujoco.mju_mat2Quat(quaternion, compiled_matrix.reshape(-1))
@@ -801,6 +1067,10 @@ class SceneAuthoringViewerPlugin:
     nonzero = np.abs(start_size) > 1e-9
     ratio[nonzero] = preview_size[nonzero] / start_size[nonzero]
     size = np.asarray(original_size, dtype=np.float64) * ratio
+    mesh_scale = np.asarray(original_mesh_scale, dtype=np.float64) * ratio
+    # The simulation side compensates mesh.refpos when the scale is
+    # committed. Keep the preview on the same visual center while dragging.
+    compiled_position = position + logical_matrix @ np.asarray(asset_position)
     if kind == "geom":
       model.geom_pos[object_id] = compiled_position
       model.geom_quat[object_id] = quaternion
@@ -809,7 +1079,10 @@ class SceneAuthoringViewerPlugin:
       model.site_pos[object_id] = compiled_position
       model.site_quat[object_id] = quaternion
       model.site_size[object_id] = size
+    model.mesh_scale[mesh_id] = mesh_scale
+    self._apply_mesh_vertex_preview(model, ratio)
     mujoco.mj_forward(model, self.viewer.data)
+    self._refresh_native_renderer_for_preview()
 
   def _pick_site(self, ray_origin, ray_direction):
     best = None
@@ -856,7 +1129,7 @@ class SceneAuthoringViewerPlugin:
     self._gizmo_start_world_position = pose[0]
     self._gizmo_start_world_matrix = pose[1]
     self._gizmo_start_handle_matrix = self._gizmo_handle_matrix(pose[1])
-    length = self._gizmo_length(pose[0])
+    length = self._gizmo_length(pose[0], node)
     self._gizmo_start_display_origin = self._gizmo_display_origin(
         node, pose[0], length
     )
@@ -868,6 +1141,7 @@ class SceneAuthoringViewerPlugin:
     self._gizmo_preview_local_position = self._gizmo_start_local_position.copy()
     self._gizmo_preview_quaternion = self._gizmo_start_quaternion.copy()
     self._gizmo_preview_size = self._gizmo_start_size.copy()
+    self._capture_runtime_preview(node)
     self._capture_mesh_preview(node)
     return True
 
@@ -1057,47 +1331,14 @@ class SceneAuthoringViewerPlugin:
     if self._gizmo_axis is None:
       return
     if node.kind in ("geom", "site"):
-      size = (
-          self._gizmo_preview_size
-          if self._gizmo_preview_size is not None else node.size
-      )
-      self._append_object_preview(
-          node.type_id, size, position, matrix, node.rgba,
-          mujoco.mjtObj.mjOBJ_GEOM if node.kind == "geom"
-          else mujoco.mjtObj.mjOBJ_SITE,
-      )
+      # The selected object is patched in the live model for the duration of
+      # the drag. Rendering it through extra_geoms would leave the old mesh
+      # visible and cannot represent mesh geometry in the native renderer.
       return
     if node.kind != "body":
       return
-    body_id = self._model_id_for_node(node)
-    if body_id < 0:
-      return
-    for geom_id in range(self.viewer.model.ngeom):
-      if int(self.viewer.model.geom_bodyid[geom_id]) != body_id:
-        continue
-      local_matrix = self.viewer.model.geom_quat[geom_id]
-      geom_matrix = np.empty((3, 3), dtype=np.float64)
-      mujoco.mju_quat2Mat(geom_matrix.reshape(-1), local_matrix)
-      geom_position = position + matrix @ self.viewer.model.geom_pos[geom_id]
-      self._append_object_preview(
-          self.viewer.model.geom_type[geom_id],
-          self.viewer.model.geom_size[geom_id],
-          geom_position, matrix @ geom_matrix,
-          self.viewer.model.geom_rgba[geom_id], mujoco.mjtObj.mjOBJ_GEOM,
-      )
-    for site_id in range(self.viewer.model.nsite):
-      if int(self.viewer.model.site_bodyid[site_id]) != body_id:
-        continue
-      local_matrix = self.viewer.model.site_quat[site_id]
-      site_matrix = np.empty((3, 3), dtype=np.float64)
-      mujoco.mju_quat2Mat(site_matrix.reshape(-1), local_matrix)
-      site_position = position + matrix @ self.viewer.model.site_pos[site_id]
-      self._append_object_preview(
-          self.viewer.model.site_type[site_id],
-          self.viewer.model.site_size[site_id],
-          site_position, matrix @ site_matrix,
-          self.viewer.model.site_rgba[site_id], mujoco.mjtObj.mjOBJ_SITE,
-      )
+    # Body children, including mesh geoms, are rendered from the temporarily
+    # patched model above. This avoids duplicate old/new geometry during drag.
 
   def _draw_gizmo(self):
     node = self._target_node()
@@ -1114,7 +1355,7 @@ class SceneAuthoringViewerPlugin:
     matrix = self._preview_world_matrix(node)
     handle_matrix = self._gizmo_handle_matrix(matrix)
     self._draw_object_preview(node, origin, matrix)
-    length = self._gizmo_length(origin)
+    length = self._gizmo_length(origin, node)
     display_origin = self._gizmo_display_origin(node, origin, length)
     if self._gizmo_mode == "rotate":
       ring_radius = length * 0.84
@@ -1159,7 +1400,7 @@ class SceneAuthoringViewerPlugin:
       self._make_primitive_preview(self.state.preview_position)
     node = self._target_node()
     if self._gizmo_axis is not None and node is not None:
-      self._apply_mesh_preview(node)
+      self._apply_runtime_preview(node)
     self._draw_gizmo()
 
   def _mouse(self):
@@ -1217,7 +1458,7 @@ class SceneAuthoringViewerPlugin:
     if node is not None and imgui.IsMouseClicked(imgui.MouseButton.Left):
       pose = self._world_pose(node)
       if pose is not None:
-        length = self._gizmo_length(pose[0])
+        length = self._gizmo_length(pose[0], node)
         display_origin = self._gizmo_display_origin(node, pose[0], length)
         # Pick only a small screen-space neighborhood around a visible
         # handle. A fixed world-space threshold becomes huge after zooming.
@@ -1289,19 +1530,37 @@ class SceneAuthoringViewerPlugin:
     return self._select_or_start_drag(mouse)
 
   def handle_keyboard_input(self) -> bool:
-    # Do not consume R/S/P/undo/delete shortcuts outside Scene Authoring.
+    # Do not consume authoring shortcuts outside Scene Authoring.
     if self.viewer is None or not self._authoring_interaction_enabled():
       return False
     delete_pressed = imgui.IsKeyPressed(imgui.Key.Delete, False)
-    if imgui.GetIO().WantCaptureKeyboard and not delete_pressed:
+    save_pressed = imgui.IsKeyChordPressed(
+        int(imgui.Key.Ctrl) | int(imgui.Key.S)
+    )
+    undo_pressed = imgui.IsKeyChordPressed(
+        int(imgui.Key.Ctrl) | int(imgui.Key.Z)
+    )
+    redo_pressed = imgui.IsKeyChordPressed(
+        int(imgui.Key.Ctrl) | int(imgui.Key.Y)
+    )
+    if (
+        imgui.GetIO().WantCaptureKeyboard
+        and not delete_pressed
+        and not save_pressed
+        and not undo_pressed
+        and not redo_pressed
+    ):
       return False
     if delete_pressed and self._rename_node_key is None:
       if self._request_delete():
         return True
-    if imgui.IsKeyChordPressed(int(imgui.Key.Ctrl) | int(imgui.Key.Z)):
+    if save_pressed and self._rename_node_key is None:
+      self._open_save_popup()
+      return True
+    if undo_pressed:
       self._send(messages.UndoEvent(self._next_request()))
       return True
-    if imgui.IsKeyChordPressed(int(imgui.Key.Ctrl) | int(imgui.Key.Y)):
+    if redo_pressed:
       self._send(messages.RedoEvent(self._next_request()))
       return True
     if imgui.IsKeyPressed(imgui.Key.R, False) and self._target_node() is not None:
@@ -1380,7 +1639,9 @@ class SceneAuthoringViewerPlugin:
       imgui.TextDisabled("Waiting for scene scan...")
       return
     child_flags = int(imgui.ChildFlags.Borders)
-    if imgui.BeginChild("SceneTreeViewport", imgui.Vec2(0, 260), child_flags):
+    if imgui.BeginChild(
+        "SceneTreeViewport", imgui.Vec2(0, self._scene_height), child_flags
+    ):
       for key in self._scene_root_keys:
         self._draw_scene_node(key)
     imgui.EndChild()
@@ -1569,6 +1830,16 @@ class SceneAuthoringViewerPlugin:
     if imgui.IsItemActive():
       delta = imgui.GetMouseDragDelta(imgui.MouseButton.Left).y
       self._property_height = max(180.0, min(1100.0, self._property_height + delta))
+      imgui.ResetMouseDragDelta(imgui.MouseButton.Left)
+
+  def _draw_scene_splitter(self):
+    imgui.Separator()
+    imgui.InvisibleButton("##SceneResize", imgui.Vec2(-1, 8))
+    if imgui.IsItemHovered() or imgui.IsItemActive():
+      imgui.SetMouseCursor(imgui.MouseCursor.ResizeNS)
+    if imgui.IsItemActive():
+      delta = imgui.GetMouseDragDelta(imgui.MouseButton.Left).y
+      self._scene_height = max(120.0, min(1100.0, self._scene_height + delta))
       imgui.ResetMouseDragDelta(imgui.MouseButton.Left)
 
   def _draw_inspected_properties(self):
@@ -2009,42 +2280,6 @@ class SceneAuthoringViewerPlugin:
       imgui.CloseCurrentPopup()
     imgui.EndPopup()
 
-  def _draw_selection_section(self):
-    viewport_selection = self.state.selected_name or "(none)"
-    tree_selection = self._scene_nodes.get(self.state.inspected_node_key)
-    tree_label = tree_selection.label if tree_selection else "(none)"
-    imgui.TextWrapped(f"Viewport: {viewport_selection}")
-    imgui.TextWrapped(f"Tree: {tree_label}")
-
-    if imgui.BeginTable(
-        "AuthoringActions", 3,
-        int(imgui.TableFlags.SizingStretchSame),
-    ):
-      for label, event_type in (
-          ("Undo", messages.UndoEvent),
-          ("Redo", messages.RedoEvent),
-      ):
-        imgui.TableNextColumn()
-        if imgui.Button(label, imgui.Vec2(-1, 0)):
-          self._send(event_type(self._next_request()))
-      imgui.TableNextColumn()
-      if imgui.Button("Delete", imgui.Vec2(-1, 0)):
-        if self.state.selected_name:
-          self._send(messages.DeleteObjectEvent(
-              self._next_request(), self.state.selected_name
-          ))
-      imgui.EndTable()
-
-    if imgui.Button("Save File", imgui.Vec2(-1, 0)):
-      self._open_save_popup()
-    if self._last_saved_path:
-      imgui.TextWrapped(f"Saved: {self._last_saved_path}")
-    if self._save_error:
-      imgui.TextColored(
-          imgui.Vec4(1.0, 0.35, 0.35, 1.0),
-          f"Save error: {self._save_error}",
-      )
-
   def _draw_panel(self):
     visible = imgui.Begin("Scene Authoring")
     # Begin() may still return true for a window hosted in an inactive dock
@@ -2071,18 +2306,24 @@ class SceneAuthoringViewerPlugin:
         int(imgui.TreeNodeFlags.Framed)
         | int(imgui.TreeNodeFlags.SpanAvailWidth)
     )
-    if imgui.TreeNodeEx("Selection", section_flags):
-      self._draw_selection_section()
-      imgui.TreePop()
     if imgui.TreeNodeEx("Scene", section_flags):
       if self.state.scene_source_path:
         imgui.TextWrapped(self.state.scene_source_path)
       self._draw_scene_tree()
+      self._draw_scene_splitter()
       imgui.TreePop()
     if imgui.TreeNodeEx("Property", section_flags):
       self._draw_inspected_properties()
       self._draw_property_splitter()
       imgui.TreePop()
+
+    if self._last_saved_path:
+      imgui.TextWrapped(f"Saved: {self._last_saved_path}")
+    if self._save_error:
+      imgui.TextColored(
+          imgui.Vec4(1.0, 0.35, 0.35, 1.0),
+          f"Save error: {self._save_error}",
+      )
 
     self._draw_save_popup()
     self._draw_create_dialog()

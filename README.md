@@ -61,12 +61,13 @@ does not patch or modify that checkout.
 - Double-click a body, geom or site name in the Scene Tree to rename it.
 - Double-click gizmo activation for body, geom and site nodes.
 - XYZ translation, `R` rotation and `S` axis scaling for supported nodes.
-- Mesh geoms use a live viewer-model preview while moving, rotating or scaling.
+- Body, primitive geom, site and mesh edits use a live viewer-model preview
+  while moving, rotating or scaling.
 - Property editing for MJCF attributes, including vector-valued `pos` and
   `quat` fields.
 - Plugin-owned undo, redo and deletion.
-- Save the edited scene back to the currently opened MJCF XML file, or choose
-  another output path in the Save File dialog.
+- Save the edited scene with **Ctrl+S**. The Save File dialog defaults to the
+  currently opened MJCF XML file, or can be used to choose another output path.
 
 ## Scene Authoring workflow
 
@@ -89,10 +90,13 @@ In the Scene Authoring panel:
   panel.
 - Select a node to inspect and edit its properties.
 - Right-click a body, geom, site or camera and choose **Delete** to remove it.
-- Select a node and press **Delete**, or use **Ctrl+Z**, to delete or undo the
-  last authoring command.
-- Each successful edit recompiles the `MjSpec` and refreshes the Scene Tree,
-  Property panel and viewport.
+- Select a node and press **Delete** to remove it. Use **Ctrl+Z** or **Ctrl+Y**
+  to undo or redo the last authoring command.
+- Pose and size edits on named bodies, geoms, sites and cameras update the
+  paused runtime model with `mj_forward()` so the viewport responds without a
+  full compile. The edit is written to `MjSpec` at commit time, and a full
+  recompile is deferred until the user resumes the simulation. Structural
+  edits and edits that cannot use this fast path still recompile immediately.
 
 ## Viewport gizmo
 
@@ -108,10 +112,10 @@ translation and rotation are supported.
 
 ## Saving
 
-**Save File** opens an in-panel dialog whose default target is the MJCF file
-currently being edited, so saving overwrites that file. You can change the
-folder or filename in the dialog to write a separate copy. The `.xml` suffix
-is added when omitted.
+Press **Ctrl+S** while the Scene Authoring tab is active to open the Save File
+dialog. Its default target is the MJCF file currently being edited, so saving
+overwrites that file. You can change the folder or filename in the dialog to
+write a separate copy. The `.xml` suffix is added when omitted.
 
 The current loader accepts MJCF XML paths. `.mjz`, binary model workflows,
 and asset/include path relocation are outside the current scope. For a mesh
@@ -124,12 +128,22 @@ the created geom references that asset.
 
 The simulation-side plugin owns the authoritative `MjSpec`, `MjModel`,
 `MjData` and command history. The viewer-side plugin owns UI state, input and
-preview geometry. Structural edits travel through MuJoCo Studio events and
-are applied with `MjSpec.recompile(model, data)`.
+frame-local preview state. During a gizmo drag, the viewer temporarily updates
+the live model arrays and calls `mj_forward()`; it restores those arrays when
+the drag ends. Releasing the mouse sends one edit event to the simulation
+plugin. Structural edits travel through MuJoCo Studio events and are applied
+with `MjSpec.recompile(model, data)`. Pose and size edits use the faster
+runtime path while paused and are recompiled once when Run is pressed.
 
 After a successful recompile, the simulation plugin updates the viewer handle,
 publishes a `ModelEvent`, and sends a fresh scene scan. Runtime IDs are
 resolved again from stable names after each model update.
+
+For scale previews, native Filament does not update uploaded mesh buffers from
+`mesh_scale` alone. The viewer plugin therefore patches the selected mesh
+vertices and normals around their visual center and refreshes native render
+resources while the drag is active. The next authoritative compile still
+rebuilds the final collision and asset data.
 
 ## Development commands
 

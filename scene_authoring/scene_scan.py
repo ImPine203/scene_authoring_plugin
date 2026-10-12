@@ -40,6 +40,20 @@ def _display_name(kind: str, name: str, index: int) -> str:
   return f"{kind.capitalize()}: {name or f'<unnamed #{index}>'}"
 
 
+def _element_size(spec: mujoco.MjSpec, kind: str, element: Any):
+  """Returns editable size values, including mesh asset scale."""
+  if kind in ("geom", "site"):
+    try:
+      if int(element.type) == int(mujoco.mjtGeom.mjGEOM_MESH):
+        mesh_name = str(getattr(element, "meshname", "") or "")
+        for mesh in spec.meshes:
+          if str(mesh.name or "") == mesh_name:
+            return _vec(mesh.scale, 3, (1.0, 1.0, 1.0))
+    except (AttributeError, TypeError, ValueError):
+      pass
+  return _vec(getattr(element, "size", None), 3, (0.0, 0.0, 0.0))
+
+
 def scan_spec(spec: mujoco.MjSpec) -> tuple[SceneNodeSnapshot, ...]:
   """Returns a stable, read-only snapshot of the spec's body tree.
 
@@ -118,7 +132,7 @@ def scan_spec(spec: mujoco.MjSpec) -> tuple[SceneNodeSnapshot, ...]:
           quaternion=_vec(
               getattr(geom, "quat", None), 4, (1.0, 0.0, 0.0, 0.0)
           ),
-          size=_vec(getattr(geom, "size", None), 3, (0.0, 0.0, 0.0)),
+          size=_element_size(spec, "geom", geom),
           type_name=_enum_name(getattr(geom, "type", "")),
           type_id=int(getattr(geom, "type", -1)),
           mass=_optional_float(getattr(geom, "mass", None)),
@@ -145,7 +159,7 @@ def scan_spec(spec: mujoco.MjSpec) -> tuple[SceneNodeSnapshot, ...]:
           quaternion=_vec(
               getattr(site, "quat", None), 4, (1.0, 0.0, 0.0, 0.0)
           ),
-          size=_vec(getattr(site, "size", None), 3, (0.0, 0.0, 0.0)),
+          size=_element_size(spec, "site", site),
           type_name=_enum_name(getattr(site, "type", "")),
           type_id=int(getattr(site, "type", -1)),
           rgba=_vec(
