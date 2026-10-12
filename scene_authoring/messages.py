@@ -45,7 +45,7 @@ class SceneScanEvent(studio_messages.Event):
 @dataclass(frozen=True)
 class CreateNodeEvent(studio_messages.Event):
   request_id: int
-  kind: Literal["body", "geom", "site"]
+  kind: Literal["body", "geom", "site", "camera"]
   parent_path: tuple[int, ...]
   name: str
   values: dict
@@ -54,7 +54,7 @@ class CreateNodeEvent(studio_messages.Event):
 @dataclass(frozen=True)
 class EditNodeEvent(studio_messages.Event):
   request_id: int
-  kind: Literal["body", "geom", "site", "joint"]
+  kind: Literal["body", "geom", "site", "camera", "joint"]
   target_path: tuple[int, ...]
   element_index: int
   values: dict

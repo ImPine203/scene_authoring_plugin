@@ -218,9 +218,7 @@ class SceneAuthoringViewerPlugin:
     if event.source_path != self.state.scene_source_path:
       source = Path(event.source_path)
       self._save_folder = str(source.parent)
-      self._save_filename = (
-          f"{source.stem}_edited{source.suffix or '.xml'}"
-      )
+      self._save_filename = source.name
       self._save_error = ""
     self.state.scene_source_path = event.source_path
     if self._gizmo_kind is not None:
@@ -307,11 +305,14 @@ class SceneAuthoringViewerPlugin:
             self.viewer.model, mujoco.mjtObj.mjOBJ_BODY, node.name
         )
       return -1
-    if node.kind not in ("geom", "site"):
+    if node.kind not in ("geom", "site", "camera"):
       return -1
     obj_type = (
         mujoco.mjtObj.mjOBJ_GEOM
-        if node.kind == "geom" else mujoco.mjtObj.mjOBJ_SITE
+        if node.kind == "geom" else (
+            mujoco.mjtObj.mjOBJ_SITE
+            if node.kind == "site" else mujoco.mjtObj.mjOBJ_CAMERA
+        )
     )
     if node.name:
       object_id = mujoco.mj_name2id(self.viewer.model, obj_type, node.name)
@@ -325,16 +326,14 @@ class SceneAuthoringViewerPlugin:
       return -1
     if node.kind == "geom":
       body_ids = self.viewer.model.geom_bodyid
-      candidates = [
-          index for index, value in enumerate(body_ids)
-          if int(value) == parent_id
-      ]
-    else:
+    elif node.kind == "site":
       body_ids = self.viewer.model.site_bodyid
-      candidates = [
-          index for index, value in enumerate(body_ids)
-          if int(value) == parent_id
-      ]
+    else:
+      body_ids = self.viewer.model.cam_bodyid
+    candidates = [
+        index for index, value in enumerate(body_ids)
+        if int(value) == parent_id
+    ]
     return candidates[node.element_index] if node.element_index < len(candidates) else -1
 
   def _node_for_model_object(self, kind, object_id):
@@ -371,6 +370,14 @@ class SceneAuthoringViewerPlugin:
         self._gizmo_kind, self._gizmo_target_path, self._gizmo_element_index
     )
 
+  def _is_fixed_camera_view(self):
+    """Returns whether Studio is currently rendering through a model camera."""
+    if self.viewer is None:
+      return False
+    return int(self.viewer.camera.type) == int(
+        mujoco.mjtCamera.mjCAMERA_FIXED
+    )
+
   def _world_pose(self, node):
     object_id = self._model_id_for_node(node)
     if object_id < 0:
@@ -395,6 +402,9 @@ class SceneAuthoringViewerPlugin:
         )
       position = self.viewer.data.geom_xpos[object_id]
       matrix = self.viewer.data.geom_xmat[object_id].reshape(3, 3)
+    elif node.kind == "camera":
+      position = self.viewer.data.cam_xpos[object_id]
+      matrix = self.viewer.data.cam_xmat[object_id].reshape(3, 3)
     else:
       if int(node.type_id) == int(mujoco.mjtGeom.mjGEOM_MESH):
         parent_position, parent_matrix = self._parent_pose(node)
@@ -555,7 +565,7 @@ class SceneAuthoringViewerPlugin:
     return pose
 
   def _activate_gizmo_node(self, node):
-    if node.kind not in ("body", "geom", "site"):
+    if node.kind not in ("body", "geom", "site", "camera"):
       return False
     if node.kind == "body" and not node.target_path:
       return False
@@ -631,9 +641,11 @@ class SceneAuthoringViewerPlugin:
     imgui.EndPopup()
 
   def _gizmo_handle_matrix(self, object_matrix):
-    if self._gizmo_mode == "rotate":
-      return object_matrix
-    return np.eye(3, dtype=np.float64)
+    # Keep the gizmo in the selected object's local frame. This matters for
+    # translate and scale as well as rotate: after an object is rotated, its
+    # local X/Y/Z axes must rotate with it instead of snapping back to world
+    # axes when the user presses P or S.
+    return np.asarray(object_matrix, dtype=np.float64).reshape(3, 3)
 
   def _clear_gizmo_drag(self):
     self._restore_mesh_preview()
@@ -1109,6 +1121,12 @@ class SceneAuthoringViewerPlugin:
     # switching to Inspector or another panel.
     if self.viewer is None or not self._authoring_interaction_enabled():
       return
+    # extra_geoms are part of the rendered world. In a fixed camera view,
+    # showing a gizmo would make the camera render its own gizmo at the camera
+    # origin, often filling the whole image with one axis color. Keep camera
+    # views clean while retaining Scene Tree and Property editing.
+    if self._is_fixed_camera_view():
+      return
     if self.state.preview_position is not None and self.state.placing:
       self._make_primitive_preview(self.state.preview_position)
     node = self._target_node()
@@ -1319,7 +1337,7 @@ class SceneAuthoringViewerPlugin:
         flags |= int(imgui.TreeNodeFlags.Selected)
       opened = imgui.TreeNodeEx(node.key, flags, node.label)
       self._handle_scene_item_click(node)
-      if node.kind in ("body", "geom", "site"):
+      if node.kind in ("body", "geom", "site", "camera"):
         self._draw_create_context(node)
       if opened:
         for child_key in node.child_keys:
@@ -1329,7 +1347,7 @@ class SceneAuthoringViewerPlugin:
 
     imgui.Selectable(f"{node.label}##{node.key}", selected)
     self._handle_scene_item_click(node)
-    if node.kind in ("body", "geom", "site"):
+    if node.kind in ("body", "geom", "site", "camera"):
       self._draw_create_context(node)
 
   def _draw_scene_tree(self):
@@ -1347,7 +1365,7 @@ class SceneAuthoringViewerPlugin:
         "name": node.name,
         "position": tuple(node.position),
     }
-    if node.kind in ("body", "geom", "site"):
+    if node.kind in ("body", "geom", "site", "camera"):
       draft["quaternion"] = tuple(node.quaternion)
     if node.kind in ("geom", "site", "joint"):
       draft["type_id"] = node.type_id
@@ -1547,7 +1565,7 @@ class SceneAuthoringViewerPlugin:
     self._draw_editable_name(node, draft)
     if node.kind in ("geom", "site", "joint"):
       self._draw_editable_type(node, draft)
-    if node.kind in ("body", "geom", "site"):
+    if node.kind in ("body", "geom", "site", "camera"):
       self._draw_editable_vector(node, draft, "Position", "position")
       self._draw_editable_vector(node, draft, "Quaternion", "quaternion")
     if node.kind in ("geom", "site"):
@@ -1729,10 +1747,17 @@ class SceneAuthoringViewerPlugin:
       parent = self._selected_body_node()
       if kind != "body" and parent is None:
         self._create_error = (
-            "Select a body in Scene before creating a geom or site."
+            "Select a body in Scene before creating a child element."
         )
         return
       parent_path = tuple(parent.target_path) if parent is not None else ()
+    if kind == "camera":
+      parent_path = tuple(parent_path)
+      values = {
+          "position": (0.0, 0.0, 0.0),
+          "quaternion": (1.0, 0.0, 0.0, 0.0),
+          "fovy": 45.0,
+      }
     else:
       parent_path = tuple(parent_path)
 
@@ -1747,6 +1772,9 @@ class SceneAuthoringViewerPlugin:
           "with_default_site": True,
           "default_site_name": self._unique_node_name("site"),
       }
+    elif kind == "camera":
+      # Camera defaults were prepared above at the selected body's origin.
+      pass
     else:
       values = {
           "position": (0.0, 0.0, 0.0),
@@ -1789,6 +1817,9 @@ class SceneAuthoringViewerPlugin:
         imgui.CloseCurrentPopup()
       if imgui.MenuItem("Site"):
         self._open_create_dialog("site", node)
+        imgui.CloseCurrentPopup()
+      if imgui.MenuItem("Camera"):
+        self._create_node("camera", parent_path=node.target_path)
         imgui.CloseCurrentPopup()
       imgui.EndMenu()
 
@@ -1900,12 +1931,14 @@ class SceneAuthoringViewerPlugin:
 
   def _open_save_popup(self):
     self._pause()
-    if not self._save_folder:
-      source = Path(self.state.scene_source_path) if self.state.scene_source_path else Path.cwd()
-      self._save_folder = str(source.parent)
-    if not self._save_filename:
-      source = Path(self.state.scene_source_path) if self.state.scene_source_path else Path("scene.xml")
-      self._save_filename = f"{source.stem}_edited{source.suffix or '.xml'}"
+    source = (
+        Path(self.state.scene_source_path)
+        if self.state.scene_source_path else Path.cwd() / "scene.xml"
+    )
+    # Reopen the dialog with the currently loaded MJCF as the default target,
+    # so Save File always means "save this scene" unless the user changes it.
+    self._save_folder = str(source.parent)
+    self._save_filename = source.name
     self._save_error = ""
     self._save_popup_pending = True
 

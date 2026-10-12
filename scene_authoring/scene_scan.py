@@ -44,7 +44,7 @@ def scan_spec(spec: mujoco.MjSpec) -> tuple[SceneNodeSnapshot, ...]:
   """Returns a stable, read-only snapshot of the spec's body tree.
 
   The traversal starts at worldbody and follows direct child bodies, joints,
-  geoms and sites. Each node has a local transform and the
+  geoms, sites and cameras. Each node has a local transform and the
   type-specific fields that are meaningful for that MJCF element.
   """
   nodes: list[SceneNodeSnapshot] = []
@@ -152,6 +152,28 @@ def scan_spec(spec: mujoco.MjSpec) -> tuple[SceneNodeSnapshot, ...]:
               getattr(site, "rgba", None), 4, (0.5, 0.5, 0.5, 1.0)
           ),
           attributes=read_extra_attributes("site", site),
+      ))
+
+    for camera_index, camera in enumerate(getattr(body, "cameras", ())):
+      counter += 1
+      camera_key = f"camera:{counter}"
+      camera_name = str(getattr(camera, "name", "") or "")
+      child_keys.append(camera_key)
+      nodes.append(SceneNodeSnapshot(
+          key=camera_key,
+          kind="camera",
+          name=camera_name,
+          label=_display_name("camera", camera_name, camera_index),
+          parent_key=key,
+          target_path=body_path,
+          element_index=camera_index,
+          position=_vec(getattr(camera, "pos", None), 3, (0.0, 0.0, 0.0)),
+          quaternion=_vec(
+              getattr(camera, "quat", None), 4, (1.0, 0.0, 0.0, 0.0)
+          ),
+          type_name=_enum_name(getattr(camera, "mode", "")),
+          type_id=int(getattr(camera, "mode", -1)),
+          attributes=read_extra_attributes("camera", camera),
       ))
 
     nodes[body_node_index] = SceneNodeSnapshot(

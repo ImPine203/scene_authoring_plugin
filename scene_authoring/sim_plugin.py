@@ -218,6 +218,13 @@ class SceneAuthoringSimPlugin:
           size=list(values.get("size", (0.05, 0.05, 0.05))),
           rgba=list(values.get("rgba", (1.0, 0.3, 0.2, 1.0))),
       )
+    if kind == "camera":
+      return parent.add_camera(
+          name=name,
+          pos=position,
+          quat=quaternion,
+          fovy=float(values.get("fovy", 45.0)),
+      )
     raise ValueError(f"Unsupported node kind: {kind}")
 
   def _node_values(self, kind, node):
@@ -225,7 +232,7 @@ class SceneAuthoringSimPlugin:
         "position": tuple(float(v) for v in node.pos),
         "name": str(node.name or ""),
     }
-    if kind in ("body", "geom", "site"):
+    if kind in ("body", "geom", "site", "camera"):
       values["quaternion"] = tuple(float(v) for v in node.quat)
     if kind in ("geom", "site", "joint"):
       values["type_id"] = int(node.type)
@@ -250,7 +257,7 @@ class SceneAuthoringSimPlugin:
       node.type = int(values["type_id"])
     if "position" in values:
       node.pos = list(values["position"])
-    if "quaternion" in values and kind in ("body", "geom", "site"):
+    if "quaternion" in values and kind in ("body", "geom", "site", "camera"):
       node.quat = list(values["quaternion"])
     if kind == "body" and "mass" in values:
       node.mass = float(values["mass"])

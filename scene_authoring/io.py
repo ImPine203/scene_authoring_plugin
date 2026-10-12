@@ -16,20 +16,10 @@ def load_spec(path: str):
   return spec, model, data
 
 
-def edited_path(source_path: str) -> str:
-  source = Path(source_path)
-  return str(source.with_name(f"{source.stem}_edited{source.suffix or '.xml'}"))
-
-
 def save_spec(spec: mujoco.MjSpec, source_path: str, target_path: str | None = None):
-  path = Path(target_path or edited_path(source_path))
-  if path.exists() and target_path is None:
-    index = 2
-    while True:
-      candidate = path.with_name(f"{path.stem}_{index}{path.suffix}")
-      if not candidate.exists():
-        path = candidate
-        break
-      index += 1
+  # Saving without an explicit target updates the MJCF currently being
+  # edited. A target supplied by the Save File dialog remains available for
+  # users who want to write a separate copy.
+  path = Path(target_path or source_path)
   spec.to_file(str(path))
   return str(path)

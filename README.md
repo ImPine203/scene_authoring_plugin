@@ -54,9 +54,10 @@ does not patch or modify that checkout.
 
 - Box and sphere placement from the viewport.
 - Mesh geom creation from a user-selected mesh file, added to the MJCF `<asset>` section.
+- Camera creation as a child of any body from the Scene Tree.
 - Static and dynamic primitives. Dynamic primitives receive a free joint.
 - Geometry picking and fallback placement on the world `Z=0` plane.
-- Scene Tree entries for bodies, geoms, sites and joints.
+- Scene Tree entries for bodies, geoms, sites, cameras and joints.
 - Double-click a body, geom or site name in the Scene Tree to rename it.
 - Double-click gizmo activation for body, geom and site nodes.
 - XYZ translation, `R` rotation and `S` axis scaling for supported nodes.
@@ -64,7 +65,8 @@ does not patch or modify that checkout.
 - Property editing for MJCF attributes, including vector-valued `pos` and
   `quat` fields.
 - Plugin-owned undo, redo and deletion.
-- Save the edited scene as a new MJCF XML file.
+- Save the edited scene back to the currently opened MJCF XML file, or choose
+  another output path in the Save File dialog.
 
 ## Scene Authoring workflow
 
@@ -82,6 +84,9 @@ In the Scene Authoring panel:
 - A new body receives a default spherical site with radius `0.01`.
 - Geom and site creation dialogs expose the supported type and size fields.
 - Mesh geom creation exposes a mesh file path and X/Y/Z mesh scale.
+- Camera creation adds a fixed camera at the selected body's local origin,
+  with editable pose, field of view and camera attributes in the Property
+  panel.
 - Select a node to inspect and edit its properties.
 - Each successful edit recompiles the `MjSpec` and refreshes the Scene Tree,
   Property panel and viewport.
@@ -100,9 +105,10 @@ translation and rotation are supported.
 
 ## Saving
 
-**Save File** opens an in-panel dialog. Choose the output folder and filename.
-The `.xml` suffix is added when omitted, and an existing file is never
-silently overwritten.
+**Save File** opens an in-panel dialog whose default target is the MJCF file
+currently being edited, so saving overwrites that file. You can change the
+folder or filename in the dialog to write a separate copy. The `.xml` suffix
+is added when omitted.
 
 The current loader accepts MJCF XML paths. `.mjz`, binary model workflows,
 and asset/include path relocation are outside the current scope. For a mesh
