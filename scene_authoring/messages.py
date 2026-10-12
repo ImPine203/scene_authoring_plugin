@@ -83,7 +83,10 @@ class TransformObjectEvent(studio_messages.Event):
 @dataclass(frozen=True)
 class DeleteObjectEvent(studio_messages.Event):
   request_id: int
-  object_name: str
+  object_name: str = ""
+  kind: str = ""
+  target_path: tuple[int, ...] = ()
+  element_index: int = -1
 
 
 @dataclass(frozen=True)

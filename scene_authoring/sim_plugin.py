@@ -484,9 +484,32 @@ class SceneAuthoringSimPlugin:
   @studio_messages.handler
   def _on_delete(self, event: messages.DeleteObjectEvent) -> bool:
     try:
-      primitive = self._delete_name(event.object_name)
-      self._recompile()
-      self._record(Command("delete", {"primitive": asdict(primitive)}))
+      if event.kind:
+        if event.kind not in ("body", "geom", "site", "camera"):
+          raise ValueError(f"Unsupported delete kind: {event.kind}")
+        if event.kind == "body" and not event.target_path:
+          raise ValueError("The world body cannot be deleted")
+        node = self._resolve_node(
+            event.kind,
+            event.target_path,
+            event.element_index,
+            event.object_name,
+        )
+        before_spec = self.spec.copy()
+        before_authored = dict(self.authored)
+        self.spec.delete(node)
+        self.authored.pop(event.object_name, None)
+        self._recompile()
+        self._record(Command("delete_spec", {
+            "before_spec": before_spec,
+            "after_spec": self.spec.copy(),
+            "before_authored": before_authored,
+            "after_authored": dict(self.authored),
+        }))
+      else:
+        primitive = self._delete_name(event.object_name)
+        self._recompile()
+        self._record(Command("delete", {"primitive": asdict(primitive)}))
       self._result(event, "delete", True, model_changed=True)
     except Exception as exc:  # pylint: disable=broad-except
       self._result(event, "delete", False, message=str(exc))
@@ -508,6 +531,14 @@ class SceneAuthoringSimPlugin:
       else:
         add_primitive(self.spec, primitive)
         self.authored[primitive.name] = primitive
+    elif command.kind == "delete_spec":
+      snapshot = payload["after_spec"] if forward else payload["before_spec"]
+      authored = (
+          payload["after_authored"] if forward
+          else payload["before_authored"]
+      )
+      self.spec = snapshot.copy()
+      self.authored = dict(authored)
     elif command.kind == "transform":
       name = payload["name"]
       body = find_authored_body(self.spec, name)

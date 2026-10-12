@@ -88,17 +88,20 @@ In the Scene Authoring panel:
   with editable pose, field of view and camera attributes in the Property
   panel.
 - Select a node to inspect and edit its properties.
+- Right-click a body, geom, site or camera and choose **Delete** to remove it.
+- Select a node and press **Delete**, or use **Ctrl+Z**, to delete or undo the
+  last authoring command.
 - Each successful edit recompiles the `MjSpec` and refreshes the Scene Tree,
   Property panel and viewport.
 
 ## Viewport gizmo
 
 Double-click a body, geom or site in the viewport to activate the gizmo.
-Double-click its name in the Scene Tree to rename it. Drag a world-aligned
-axis to translate the selected node. Press `R` and drag an axis to rotate its
-quaternion using the object's current orientation. Press `S` and drag an axis
-to scale supported geom/site dimensions. Press `P` or `T` to return to
-translation mode. Press `Esc` to cancel the current gizmo mode.
+Double-click its name in the Scene Tree to rename it. Drag a local axis to
+translate the selected node. Press `R` and drag an axis to
+rotate its quaternion using the object's current orientation. Press `S` and
+drag an axis to scale supported geom/site dimensions. Press `P` or `T` to
+return to translation mode. Press `Esc` to cancel the current gizmo mode.
 
 A body has no MJCF `size` attribute, so body scaling is not available. Body
 translation and rotation are supported.

@@ -590,6 +590,34 @@ class SceneAuthoringViewerPlugin:
     self._rename_error = ""
     self._rename_popup_pending = True
 
+  def _deletable_node(self, node):
+    if node is None:
+      return False
+    if node.kind not in ("body", "geom", "site", "camera"):
+      return False
+    return not (node.kind == "body" and not node.target_path)
+
+  def _request_delete(self, node=None):
+    if node is None:
+      node = self._scene_nodes.get(self.state.inspected_node_key)
+    if not self._deletable_node(node):
+      return False
+    self._pause()
+    # The model/scene scan that follows may shift element indices. Drop the
+    # active gizmo before deletion so it cannot attach itself to the next node
+    # that happens to occupy the deleted node's index.
+    self._clear_gizmo_drag()
+    self._gizmo_node_key = None
+    self._gizmo_kind = None
+    self._send(messages.DeleteObjectEvent(
+        request_id=self._next_request(),
+        object_name=node.name,
+        kind=node.kind,
+        target_path=tuple(node.target_path),
+        element_index=node.element_index,
+    ))
+    return True
+
   def _draw_rename_popup(self):
     if self._rename_popup_pending:
       imgui.OpenPopup("Rename Element##SceneAuthoring")
@@ -1262,12 +1290,14 @@ class SceneAuthoringViewerPlugin:
 
   def handle_keyboard_input(self) -> bool:
     # Do not consume R/S/P/undo/delete shortcuts outside Scene Authoring.
-    if (
-        self.viewer is None
-        or not self._authoring_interaction_enabled()
-        or imgui.GetIO().WantCaptureKeyboard
-    ):
+    if self.viewer is None or not self._authoring_interaction_enabled():
       return False
+    delete_pressed = imgui.IsKeyPressed(imgui.Key.Delete, False)
+    if imgui.GetIO().WantCaptureKeyboard and not delete_pressed:
+      return False
+    if delete_pressed and self._rename_node_key is None:
+      if self._request_delete():
+        return True
     if imgui.IsKeyChordPressed(int(imgui.Key.Ctrl) | int(imgui.Key.Z)):
       self._send(messages.UndoEvent(self._next_request()))
       return True
@@ -1297,11 +1327,6 @@ class SceneAuthoringViewerPlugin:
     if imgui.IsKeyPressed(imgui.Key.Escape, False) and self._target_node() is not None:
       self._gizmo_mode = "translate"
       self._clear_gizmo_drag()
-      return True
-    if imgui.IsKeyChordPressed(imgui.Key.Delete) and self.state.selected_name:
-      self._send(messages.DeleteObjectEvent(
-          self._next_request(), self.state.selected_name
-      ))
       return True
     return False
 
@@ -1826,6 +1851,9 @@ class SceneAuthoringViewerPlugin:
     rename_enabled = not (node.kind == "body" and not node.target_path)
     if imgui.MenuItem("Rename", enabled=rename_enabled):
       self._begin_rename(node)
+      imgui.CloseCurrentPopup()
+    if imgui.MenuItem("Delete", enabled=self._deletable_node(node)):
+      self._request_delete(node)
       imgui.CloseCurrentPopup()
     imgui.EndPopup()
 
